@@ -674,6 +674,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchvision" },
     { name = "transformers" },
+    { name = "trl" },
 ]
 
 [package.metadata]
@@ -689,6 +690,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.12.0" },
     { name = "torchvision", specifier = ">=0.27.0" },
     { name = "transformers", specifier = ">=5.8.1" },
+    { name = "trl", specifier = ">=1.4.0" },
 ]
 
 [[package]]
@@ -2037,6 +2039,22 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/8f/af/9904ec6d3c93d9b24e5ec360445bbdf758b7f00bfbeedb89cb0eb64eb8bb/triton-3.7.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b9b85e72968a9d8bba5ddb24e9b64aaabaf48affb042f2755cb7cfa92b7531ce", size = 201460637, upload-time = "2026-05-07T18:46:34.749Z" },
     { url = "https://files.pythonhosted.org/packages/a1/f9/4835a8ea746b88727d8899f4e3ccce4f9cacb38abfc3bb0a638266c53111/triton-3.7.0-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:18a160de426fd99f92b0baf509045360afbd3bfaa0b4a5171dde800ec9f09684", size = 188608706, upload-time = "2026-05-07T19:05:39.218Z" },
     { url = "https://files.pythonhosted.org/packages/c1/68/fa86e5a39608000f645535b2c124920126327ab731f8c4fafd5b07ff8d4b/triton-3.7.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ce061073102714b725f3660ec6939d94a1da7984b3aa99c921417cae273672f5", size = 201546766, upload-time = "2026-05-07T18:46:42.088Z" },
+]
+
+[[package]]
+name = "trl"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "accelerate" },
+    { name = "datasets" },
+    { name = "jinja2" },
+    { name = "packaging" },
+    { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ac/fe/eaa56e5d1bb7c418340dcc97c7d1a724dda0d42419e1b3c16c230af942b1/trl-1.4.0.tar.gz", hash = "sha256:37f9b9a4401922469f02be85c6230ddfc680d746338c5d3f6fc5641fbff83908", size = 619070, upload-time = "2026-05-08T23:24:14.346Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/29/f4/74bf11119cad07b3cd72b0c7213c5e90b17025b4af429418b72314b245bc/trl-1.4.0-py3-none-any.whl", hash = "sha256:d8c1aeaa196cdaf2156206aa087d8c332c59e197d70b07585a1228abc19822c6", size = 751040, upload-time = "2026-05-08T23:24:12.989Z" },
 ]
 
 [[package]]
