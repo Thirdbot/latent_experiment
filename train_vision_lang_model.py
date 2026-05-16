@@ -97,6 +97,71 @@ class SeismicImageDataset(Dataset):
         }
 
 
+class VisionClassifierCollator:
+    def __init__(self, processor):
+        self.processor = processor
+
+    def __call__(self, examples):
+        inputs = self.processor(
+            images=[example["image"] for example in examples],
+            return_tensors="pt",
+            padding=True,
+        )
+        inputs["labels"] = torch.tensor(
+            [example["label"] for example in examples],
+            dtype=torch.long,
+        )
+        return inputs
+
+
+class VisionAdapterClassifier(nn.Module):
+    def __init__(self, model_name=MODEL_NAME):
+        super().__init__()
+
+        base_model = AutoModelForImageTextToText.from_pretrained(model_name)
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=r".*vision_model.*self_attn.*(q_proj|k_proj|v_proj|out_proj)$",
+        )
+        self.model = get_peft_model(base_model, lora_config)
+
+        for name, param in self.model.named_parameters():
+            param.requires_grad = "vision_model" in name and "lora_" in name
+
+        hidden_size = self.model.base_model.model.config.vision_config.hidden_size
+        self.classifier = nn.Linear(hidden_size, len(LABEL_MAP))
+        self.model.print_trainable_parameters()
+
+    def forward(self, pixel_values, labels=None, **kwargs):
+        if pixel_values.dim() == 5:
+            batch_size, num_images, channels, height, width = pixel_values.shape
+            pixel_values = pixel_values.reshape(batch_size * num_images, channels, height, width)
+        else:
+            batch_size = pixel_values.shape[0]
+            num_images = 1
+
+        vision_dtype = next(self.model.base_model.model.model.vision_model.parameters()).dtype
+        pixel_values = pixel_values.to(dtype=vision_dtype)
+        vision_outputs = self.model.base_model.model.model.vision_model(pixel_values=pixel_values)
+        pooled = vision_outputs.last_hidden_state.mean(dim=1)
+        pooled = pooled.reshape(batch_size, num_images, -1).mean(dim=1)
+        pooled = pooled.to(dtype=self.classifier.weight.dtype)
+        logits = self.classifier(pooled)
+
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(logits.float(), labels.long())
+
+        return {"loss": loss, "logits": logits}
+
+    def save_pretrained(self, output_dir):
+        self.model.save_pretrained(output_dir)
+        torch.save(self.classifier.state_dict(), Path(output_dir) / "classifier_head.pt")
+
+
 def print_one_eval_example(model, processor, split="test", index=0):
     dataset = load_dataset("thinkonward/reflection-connection", split=split)
     sample = dataset[index]
@@ -277,40 +342,54 @@ def output_steering_loss(
 
 
 class DecoderLatentAlignmentModel(nn.Module):
-    def __init__(self, model_name=MODEL_NAME, adapter_path=OUTPUT_DIR / "final", latent_dim=512):
+    def __init__(self, model_name=MODEL_NAME, vision_adapter_path=OUTPUT_DIR / "final", latent_dim=512):
         super().__init__()
 
         base_model = AutoModelForImageTextToText.from_pretrained(model_name)
-        adapter_path = Path(adapter_path)
-        if adapter_path.exists():
+        vision_adapter_path = Path(vision_adapter_path)
+        if vision_adapter_path.exists():
             self.model = PeftModel.from_pretrained(
                 base_model,
-                adapter_path.as_posix(),
-                is_trainable=True,
+                vision_adapter_path.as_posix(),
+                adapter_name="vision_adapter",
+                is_trainable=False,
             )
-            print(f"loaded decoder adapter from {adapter_path}")
+            print(f"loaded frozen vision adapter from {vision_adapter_path}")
         else:
-            print(f"adapter not found at {adapter_path}; starting from a fresh LoRA adapter")
-            lora_config = LoraConfig(
-                r=16,
-                lora_alpha=16,
-                lora_dropout=0.0,
-                bias="none",
-                target_modules=[
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                ],
-                modules_to_save=["lm_head", "embed_tokens"],
+            print(f"vision adapter not found at {vision_adapter_path}; using frozen base vision tower")
+            self.model = get_peft_model(
+                base_model,
+                LoraConfig(
+                    r=16,
+                    lora_alpha=16,
+                    lora_dropout=0.0,
+                    bias="none",
+                    target_modules=r".*vision_model.*self_attn.*(q_proj|k_proj|v_proj|out_proj)$",
+                ),
+                adapter_name="vision_adapter",
             )
-            self.model = get_peft_model(base_model, lora_config)
+
+        decoder_lora_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            modules_to_save=["lm_head", "embed_tokens"],
+        )
+        self.model.add_adapter("decoder_adapter", decoder_lora_config)
+        self.model.set_adapter(["vision_adapter", "decoder_adapter"])
 
         for name, param in self.model.named_parameters():
-            # skip vision model
+            param.requires_grad = "decoder_adapter" in name
             if "vision_model" in name or "connector" in name:
                 param.requires_grad = False
 
@@ -322,6 +401,8 @@ class DecoderLatentAlignmentModel(nn.Module):
         # skip vision encoder
         for param in self.vision_projector.parameters():
             param.requires_grad = False
+        for param in self.decoder_projector.parameters():
+            param.requires_grad = True
         # pairing decoder latent to encoder talent
         self.infonce_loss = NTXentLoss(temperature=0.07)
         # paring label to its latent anchor
@@ -430,39 +511,19 @@ class LatentAlignmentTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 def train_decoder_with_label():
-    model = AutoModelForImageTextToText.from_pretrained(MODEL_NAME)
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
+    model = VisionAdapterClassifier(MODEL_NAME)
 
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=16,
-        lora_dropout=0.0,
-        bias="none",
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-        modules_to_save=["lm_head", "embed_tokens"],
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    train_dataset = SeismicImageDataset("train")
+    test_dataset = SeismicImageDataset("test")
 
-    # Keep this as a Python dataset so Arrow does not try to serialize nested chat messages.
-    train_conversations = SeismicConversationDataset("train")
-    test_conversations = SeismicConversationDataset("test")
-
-    args = SFTConfig(
+    args = TrainingArguments(
         output_dir=OUTPUT_DIR.as_posix(),
         logging_dir="logs",
         learning_rate=2e-4,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
-        num_train_epochs=10,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        num_train_epochs=20,
         weight_decay=0.02,
         warmup_steps=50,
         eval_strategy="epoch",
@@ -472,15 +533,14 @@ def train_decoder_with_label():
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         remove_unused_columns=False,
-        max_length=None,
     )
-    # self-supervised training with label to train decoder. will change to custom trainer for training decoder
-    trainer = SFTTrainer(
+
+    trainer = Trainer(
         model=model,
-        train_dataset=train_conversations,
-        eval_dataset=test_conversations,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
         args=args,
-        processing_class=processor,
+        data_collator=VisionClassifierCollator(processor),
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=2,
@@ -491,13 +551,12 @@ def train_decoder_with_label():
     trainer.train()
     trainer.evaluate()
     trainer.save_model((OUTPUT_DIR / "final").as_posix())
-    print_one_eval_example(model, processor)
 
 def train_decoder_without_label():
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
     model = DecoderLatentAlignmentModel(
         model_name=MODEL_NAME,
-        adapter_path=OUTPUT_DIR / "final",
+        vision_adapter_path=OUTPUT_DIR / "final",
     )
 
     train_dataset = SeismicImageDataset("train")
