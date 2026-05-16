@@ -18,6 +18,26 @@ INSTRUCTION = "You are an expert geophysicist.Using only these  Classify this se
 
 OUTPUT_DIR = Path("outputs/vision_llm_trained")
 CUSTOM_OUTPUT_DIR = Path("outputs/vision_llm_trained_custom")
+DOMAIN_WORDS = [
+    "reflector",
+    "reflectors",
+    "amplitude",
+    "amplitudes",
+    "fault",
+    "offset",
+    "break",
+    "discontinuity",
+    "discontinuous",
+    "chaotic",
+    "planar",
+    "channel",
+    "converging",
+    "transparent",
+    "layered",
+    "continuous",
+    "interrupted",
+    "salt",
+]
 
 LABEL_MAP = {
     0: "Boring",
@@ -127,6 +147,22 @@ def print_one_eval_example(model, processor, split="test", index=0):
 class DecoderLatentCollator:
     def __init__(self, processor):
         self.processor = processor
+        self.domain_token_ids = self._build_domain_token_ids()
+
+    def _build_domain_token_ids(self):
+        token_ids = set()
+        for word in DOMAIN_WORDS:
+            encoded = self.processor.tokenizer(
+                word,
+                add_special_tokens=False,
+            ).input_ids
+            token_ids.update(encoded)
+            encoded_with_space = self.processor.tokenizer(
+                f" {word}",
+                add_special_tokens=False,
+            ).input_ids
+            token_ids.update(encoded_with_space)
+        return sorted(token_ids)
 
     def __call__(self, examples):
         # template
@@ -163,6 +199,10 @@ class DecoderLatentCollator:
             [example["label"] for example in examples],
             dtype=torch.long,
         )
+        inputs["domain_token_ids"] = torch.tensor(
+            self.domain_token_ids,
+            dtype=torch.long,
+        )
         return inputs
 
 
@@ -181,6 +221,59 @@ def coverage_loss(embeddings):
     similarity = embeddings @ embeddings.T
     off_diagonal = similarity[~torch.eye(similarity.size(0), dtype=torch.bool, device=similarity.device)]
     return off_diagonal.pow(2).mean()
+
+
+def token_level_alignment_loss(token_latents, vision_latent, attention_mask=None):
+    token_latents = F.normalize(token_latents.float(), dim=-1)
+    vision_latent = F.normalize(vision_latent.float(), dim=-1)
+    distances = 1.0 - F.cosine_similarity(token_latents, vision_latent.unsqueeze(1), dim=-1)
+
+    if attention_mask is None:
+        return distances.mean()
+
+    mask = attention_mask.to(distances.device, dtype=distances.dtype)
+    return (distances * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def output_steering_loss(
+    logits,
+    input_ids,
+    domain_token_ids,
+    eos_token_id=None,
+    min_response_tokens=8,
+    max_response_tokens=40,
+):
+    if logits.size(1) < 2:
+        return logits.new_zeros(())
+
+    next_token_logits = logits[:, :-1, :].float()
+    next_token_ids = input_ids[:, 1:]
+    log_probs = F.log_softmax(next_token_logits, dim=-1)
+    probs = log_probs.exp()
+
+    sequence_length = next_token_logits.size(1)
+    early_window = min(min_response_tokens, sequence_length)
+    late_start = min(max_response_tokens, sequence_length)
+
+    if eos_token_id is not None:
+        eos_probs = probs[:, :, eos_token_id]
+        early_eos_penalty = eos_probs[:, :early_window].mean()
+        late_eos_reward = -0.05 * eos_probs[:, late_start:].mean() if late_start < sequence_length else logits.new_zeros(())
+    else:
+        early_eos_penalty = logits.new_zeros(())
+        late_eos_reward = logits.new_zeros(())
+
+    if domain_token_ids is not None and domain_token_ids.numel() > 0:
+        domain_token_ids = domain_token_ids.to(next_token_logits.device)
+        domain_prob = probs[:, :early_window, :].index_select(-1, domain_token_ids).sum(dim=-1)
+        domain_reward = -torch.log(domain_prob.clamp_min(1e-8)).mean()
+    else:
+        domain_reward = logits.new_zeros(())
+
+    repeated = next_token_ids[:, 1:] == next_token_ids[:, :-1]
+    repetition_penalty = repeated.float().mean() if repeated.numel() > 0 else logits.new_zeros(())
+
+    return early_eos_penalty + 0.2 * domain_reward + 0.1 * repetition_penalty + late_eos_reward
 
 
 class DecoderLatentAlignmentModel(nn.Module):
@@ -261,7 +354,7 @@ class DecoderLatentAlignmentModel(nn.Module):
         vision_hidden = vision_hidden.to(dtype=self.vision_projector.weight.dtype)
         return self.vision_projector(vision_hidden)
 
-    def forward(self, metric_labels=None, **inputs):
+    def forward(self, metric_labels=None, domain_token_ids=None, **inputs):
         vision_dtype = next(self.model.base_model.model.model.vision_model.parameters()).dtype
         if "pixel_values" in inputs:
             inputs["pixel_values"] = inputs["pixel_values"].to(dtype=vision_dtype)
@@ -281,6 +374,8 @@ class DecoderLatentAlignmentModel(nn.Module):
         decoder_hidden = mean_pool_hidden(outputs.hidden_states[-1], attention_mask)
         decoder_hidden = decoder_hidden.to(dtype=self.decoder_projector.weight.dtype)
         decoder_latent = self.decoder_projector(decoder_hidden)
+        token_hidden = outputs.hidden_states[-1].to(dtype=self.decoder_projector.weight.dtype)
+        token_latents = self.decoder_projector(token_hidden)
 
         #normalise latents
         decoder_latent = F.normalize(decoder_latent.float(), dim=-1)
@@ -298,6 +393,13 @@ class DecoderLatentAlignmentModel(nn.Module):
         coverage = coverage_loss(decoder_latent)
 
         cosine = 1.0 - F.cosine_similarity(decoder_latent, vision_latent, dim=-1).mean()
+        token_alignment = token_level_alignment_loss(token_latents, vision_latent, attention_mask)
+        output_steering = output_steering_loss(
+            outputs.logits,
+            inputs["input_ids"],
+            domain_token_ids,
+            eos_token_id=self.model.config.eos_token_id,
+        )
 
         loss = (
             infonce
@@ -305,6 +407,8 @@ class DecoderLatentAlignmentModel(nn.Module):
             + metric_cross_entropy
             + 0.1 * coverage
             + cosine
+            + 0.25 * token_alignment
+            + 0.5 * output_steering
         )
 
         return {
@@ -314,6 +418,8 @@ class DecoderLatentAlignmentModel(nn.Module):
             "metric_cross_entropy_loss": metric_cross_entropy.detach(),
             "coverage_loss": coverage.detach(),
             "cosine_loss": cosine.detach(),
+            "token_alignment_loss": token_alignment.detach(),
+            "output_steering_loss": output_steering.detach(),
         }
 
 
