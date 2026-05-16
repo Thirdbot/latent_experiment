@@ -589,7 +589,7 @@ def train_decoder_without_label():
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
         gradient_accumulation_steps=4,
-        num_train_epochs=5,
+        num_train_epochs=1,
         weight_decay=0.02,
         warmup_steps=25,
         eval_strategy="epoch",
@@ -623,7 +623,7 @@ def train_decoder_without_label():
 
 def main():
     train_decoder_with_label() # train vision-adapter and decoder with output label
-
+    train_decoder_without_label()
 # train using unsloth
 # custom loss only for decoder layer
 def test_understanding():
