@@ -1,0 +1,17 @@
+[project]
+name = "latent-experiment"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.13.0",
+    "bitsandbytes>=0.46.1",
+    "datasets>=4.8.5",
+    "peft>=0.18.0",
+    "pillow>=12.2.0",
+    "protobuf>=7.34.1",
+    "requests>=2.34.2",
+    "sentencepiece>=0.2.1",
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
+    "transformers>=5.8.1",
+]
