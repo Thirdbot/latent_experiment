@@ -143,6 +143,16 @@ class VisionAdapterClassifier(nn.Module):
         self.classifier = nn.Linear(hidden_size, len(LABEL_MAP))
         self.model.print_trainable_parameters()
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
+            )
+
+    def gradient_checkpointing_disable(self):
+        if hasattr(self.model, "gradient_checkpointing_disable"):
+            self.model.gradient_checkpointing_disable()
+
     def forward(self, pixel_values, labels=None, **kwargs):
         if pixel_values.dim() == 5:
             batch_size, num_images, channels, height, width = pixel_values.shape
