@@ -118,7 +118,15 @@ class VisionAdapterClassifier(nn.Module):
     def __init__(self, model_name=MODEL_NAME):
         super().__init__()
 
-        base_model = AutoModelForImageTextToText.from_pretrained(model_name)
+        model_kwargs = {}
+        if torch.cuda.is_available():
+            model_kwargs["torch_dtype"] = torch.bfloat16
+
+        base_model = AutoModelForImageTextToText.from_pretrained(model_name, **model_kwargs)
+        base_model.config.use_cache = False
+        if hasattr(base_model, "gradient_checkpointing_enable"):
+            base_model.gradient_checkpointing_enable()
+
         lora_config = LoraConfig(
             r=16,
             lora_alpha=16,
@@ -521,11 +529,13 @@ def train_decoder_with_label():
         output_dir=OUTPUT_DIR.as_posix(),
         logging_dir="logs",
         learning_rate=2e-4,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=4,
         num_train_epochs=20,
         weight_decay=0.02,
         warmup_steps=50,
+        gradient_checkpointing=True,
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
