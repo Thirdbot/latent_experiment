@@ -211,6 +211,7 @@ class DecoderLatentAlignmentModel(nn.Module):
         vision_outputs = self.model.base_model.model.model.vision_model(pixel_values=pixel_values)
         vision_hidden = vision_outputs.last_hidden_state.mean(dim=1)
         vision_hidden = vision_hidden.reshape(batch_size, num_images, -1).mean(dim=1)
+        vision_hidden = vision_hidden.to(dtype=self.vision_projector.weight.dtype)
         return self.vision_projector(vision_hidden)
 
     def forward(self, metric_labels=None, **inputs):
@@ -231,6 +232,7 @@ class DecoderLatentAlignmentModel(nn.Module):
             use_cache=False,
         )
         decoder_hidden = mean_pool_hidden(outputs.hidden_states[-1], attention_mask)
+        decoder_hidden = decoder_hidden.to(dtype=self.decoder_projector.weight.dtype)
         decoder_latent = self.decoder_projector(decoder_hidden)
 
         #normalise latents
