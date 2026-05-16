@@ -423,12 +423,18 @@ def train_decoder_without_label():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=DecoderLatentCollator(processor),
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=2,
+                early_stopping_threshold=0.001,
+            )
+        ],
     )
 
     trainer.train()
     trainer.evaluate()
     trainer.save_model((CUSTOM_OUTPUT_DIR / "final").as_posix())
-
+    print_one_eval_example(model.model, processor)
 
 def main():
     train_decoder_with_label() # train vision-adapter and decoder with output label
