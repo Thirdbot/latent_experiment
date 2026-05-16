@@ -432,6 +432,23 @@ class DecoderLatentAlignmentModel(nn.Module):
 
         self.model.print_trainable_parameters()
 
+    def get_eos_token_id(self):
+        generation_config = getattr(self.model, "generation_config", None)
+        if generation_config is not None and getattr(generation_config, "eos_token_id", None) is not None:
+            return generation_config.eos_token_id
+
+        config = getattr(self.model, "config", None)
+        if config is not None:
+            eos_token_id = getattr(config, "eos_token_id", None)
+            if eos_token_id is not None:
+                return eos_token_id
+
+            text_config = getattr(config, "text_config", None)
+            if text_config is not None and getattr(text_config, "eos_token_id", None) is not None:
+                return text_config.eos_token_id
+
+        return None
+
     def encode_vision_target(self, pixel_values):
         # batching or not
         if pixel_values.dim() == 5:
@@ -493,7 +510,7 @@ class DecoderLatentAlignmentModel(nn.Module):
             outputs.logits,
             inputs["input_ids"],
             domain_token_ids,
-            eos_token_id=self.model.config.eos_token_id,
+            eos_token_id=self.get_eos_token_id(),
         )
 
         loss = (
