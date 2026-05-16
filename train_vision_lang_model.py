@@ -5,7 +5,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor, Trainer, TrainingArguments
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from trl import SFTConfig, SFTTrainer
 from pytorch_metric_learning.losses import NTXentLoss, NormalizedSoftmaxLoss, ProxyAnchorLoss
 
@@ -137,28 +137,37 @@ def coverage_loss(embeddings):
 
 
 class DecoderLatentAlignmentModel(nn.Module):
-    def __init__(self, model_name=MODEL_NAME, latent_dim=512):
+    def __init__(self, model_name=MODEL_NAME, adapter_path=OUTPUT_DIR / "final", latent_dim=512):
         super().__init__()
 
-        self.model = AutoModelForImageTextToText.from_pretrained(model_name)
-
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=16,
-            lora_dropout=0.0,
-            bias="none",
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            modules_to_save=["lm_head", "embed_tokens"],
-        )
-        self.model = get_peft_model(self.model, lora_config)
+        base_model = AutoModelForImageTextToText.from_pretrained(model_name)
+        adapter_path = Path(adapter_path)
+        if adapter_path.exists():
+            self.model = PeftModel.from_pretrained(
+                base_model,
+                adapter_path.as_posix(),
+                is_trainable=True,
+            )
+            print(f"loaded decoder adapter from {adapter_path}")
+        else:
+            print(f"adapter not found at {adapter_path}; starting from a fresh LoRA adapter")
+            lora_config = LoraConfig(
+                r=16,
+                lora_alpha=16,
+                lora_dropout=0.0,
+                bias="none",
+                target_modules=[
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+                modules_to_save=["lm_head", "embed_tokens"],
+            )
+            self.model = get_peft_model(base_model, lora_config)
 
         for name, param in self.model.named_parameters():
             # skip vision model
@@ -197,12 +206,18 @@ class DecoderLatentAlignmentModel(nn.Module):
             batch_size = pixel_values.shape[0]
             num_images = 1
         # project to latents
+        vision_dtype = next(self.model.base_model.model.model.vision_model.parameters()).dtype
+        pixel_values = pixel_values.to(dtype=vision_dtype)
         vision_outputs = self.model.base_model.model.model.vision_model(pixel_values=pixel_values)
         vision_hidden = vision_outputs.last_hidden_state.mean(dim=1)
         vision_hidden = vision_hidden.reshape(batch_size, num_images, -1).mean(dim=1)
         return self.vision_projector(vision_hidden)
 
     def forward(self, metric_labels=None, **inputs):
+        vision_dtype = next(self.model.base_model.model.model.vision_model.parameters()).dtype
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(dtype=vision_dtype)
+
         pixel_values = inputs["pixel_values"]
         attention_mask = inputs.get("attention_mask")
 
@@ -318,7 +333,10 @@ def train_decoder_with_label():
 
 def train_decoder_without_label():
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    model = DecoderLatentAlignmentModel(MODEL_NAME)
+    model = DecoderLatentAlignmentModel(
+        model_name=MODEL_NAME,
+        adapter_path=OUTPUT_DIR / "final",
+    )
 
     train_dataset = SeismicImageDataset("train")
     eval_dataset = SeismicImageDataset("test")
