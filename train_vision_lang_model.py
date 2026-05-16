@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
-from transformers import AutoModelForImageTextToText, AutoProcessor, Trainer, TrainingArguments
+from transformers import AutoModelForImageTextToText, AutoProcessor, EarlyStoppingCallback, Trainer, TrainingArguments
 from peft import LoraConfig, PeftModel, get_peft_model
 from trl import SFTConfig, SFTTrainer
 from pytorch_metric_learning.losses import NTXentLoss, NormalizedSoftmaxLoss, ProxyAnchorLoss
@@ -75,6 +75,53 @@ class SeismicImageDataset(Dataset):
             "image": sample["image"].convert("RGB"),
             "label": int(sample["label"]),
         }
+
+
+def print_one_eval_example(model, processor, split="test", index=0):
+    dataset = load_dataset("thinkonward/reflection-connection", split=split)
+    sample = dataset[index]
+    label = LABEL_MAP[sample["label"]]
+    image = sample["image"].convert("RGB")
+    image_path = sample.get("image_path") or sample.get("path") or f"{split}[{index}]"
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": INSTRUCTION},
+            ],
+        }
+    ]
+    prompt = processor.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    inputs = processor(
+        text=[prompt],
+        images=[[image]],
+        return_tensors="pt",
+    )
+    device = next(model.parameters()).device
+    inputs = {
+        key: value.to(device) if hasattr(value, "to") else value
+        for key, value in inputs.items()
+    }
+
+    model.eval()
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=80)
+    prompt_len = inputs["input_ids"].shape[-1]
+    generated_text = processor.batch_decode(
+        generated_ids[:, prompt_len:],
+        skip_special_tokens=True,
+    )[0].strip()
+
+    print("one-example evaluation")
+    print(f"source: {image_path}")
+    print(f"label: {label}")
+    print(f"generated: {generated_text}")
 
 
 class DecoderLatentCollator:
@@ -328,10 +375,17 @@ def train_decoder_with_label():
         eval_dataset=test_conversations,
         args=args,
         processing_class=processor,
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=2,
+                early_stopping_threshold=0.001,
+            )
+        ],
     )
     trainer.train()
     trainer.evaluate()
     trainer.save_model((OUTPUT_DIR / "final").as_posix())
+    print_one_eval_example(model, processor)
 
 def train_decoder_without_label():
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
