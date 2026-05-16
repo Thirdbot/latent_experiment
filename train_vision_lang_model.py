@@ -366,26 +366,18 @@ class DecoderLatentAlignmentModel(nn.Module):
         base_model = AutoModelForImageTextToText.from_pretrained(model_name)
         vision_adapter_path = Path(vision_adapter_path)
         if vision_adapter_path.exists():
-            self.model = PeftModel.from_pretrained(
+            vision_model = PeftModel.from_pretrained(
                 base_model,
                 vision_adapter_path.as_posix(),
                 adapter_name="vision_adapter",
                 is_trainable=False,
             )
             print(f"loaded frozen vision adapter from {vision_adapter_path}")
+            self.model = vision_model.merge_and_unload()
+            print("merged vision adapter into base model for decoder-adapter training")
         else:
             print(f"vision adapter not found at {vision_adapter_path}; using frozen base vision tower")
-            self.model = get_peft_model(
-                base_model,
-                LoraConfig(
-                    r=16,
-                    lora_alpha=16,
-                    lora_dropout=0.0,
-                    bias="none",
-                    target_modules=r".*vision_model.*self_attn.*(q_proj|k_proj|v_proj|out_proj)$",
-                ),
-                adapter_name="vision_adapter",
-            )
+            self.model = base_model
 
         decoder_lora_config = LoraConfig(
             r=16,
@@ -403,8 +395,12 @@ class DecoderLatentAlignmentModel(nn.Module):
             ],
             modules_to_save=["lm_head", "embed_tokens"],
         )
-        self.model.add_adapter("decoder_adapter", decoder_lora_config)
-        self.model.set_adapter(["vision_adapter", "decoder_adapter"])
+        self.model = get_peft_model(
+            self.model,
+            decoder_lora_config,
+            adapter_name="decoder_adapter",
+        )
+        self.model.set_adapter("decoder_adapter")
 
         for name, param in self.model.named_parameters():
             param.requires_grad = "decoder_adapter" in name
