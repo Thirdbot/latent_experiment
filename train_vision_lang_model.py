@@ -204,6 +204,13 @@ def token_level_alignment_loss(token_latents, vision_latent, attention_mask=None
     return (distances * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def anchor_usage_loss(image_probs, decoder_probs):
+    probs = torch.cat([image_probs, decoder_probs], dim=0)
+    mean_probs = probs.mean(dim=0)
+    target = torch.full_like(mean_probs, 1.0 / mean_probs.numel())
+    return F.kl_div(mean_probs.clamp_min(1e-8).log(), target, reduction="batchmean")
+
+
 class DecoderLatentCollator:
     def __init__(self, processor):
         self.processor = processor
@@ -243,7 +250,14 @@ class DecoderLatentCollator:
 
 
 class DecoderLatentAlignmentModel(nn.Module):
-    def __init__(self, model_name=MODEL_NAME, vision_adapter_path=OUTPUT_DIR / "final", latent_dim=512):
+    def __init__(
+        self,
+        model_name=MODEL_NAME,
+        vision_adapter_path=OUTPUT_DIR / "final",
+        latent_dim=512,
+        num_anchors=64,
+        anchor_temperature=0.1,
+    ):
         super().__init__()
 
         self.model, self.processor = load_unsloth_vision_model(model_name)
@@ -286,6 +300,8 @@ class DecoderLatentAlignmentModel(nn.Module):
         self.image_token_id = get_image_token_id(self.model, self.processor)
         self.decoder_projector = nn.Linear(hidden_size, latent_dim)
         self.vision_projector = nn.Linear(hidden_size, latent_dim)
+        self.anchor_temperature = anchor_temperature
+        self.anchors = nn.Parameter(torch.randn(num_anchors, latent_dim) * 0.02)
 
         for param in self.vision_projector.parameters():
             param.requires_grad = False
@@ -303,6 +319,15 @@ class DecoderLatentAlignmentModel(nn.Module):
         )
 
         self.model.print_trainable_parameters()
+
+    def quantize_with_anchors(self, latents):
+        anchors = F.normalize(self.anchors.float(), dim=-1)
+        latents = F.normalize(latents.float(), dim=-1)
+        logits = latents @ anchors.T / self.anchor_temperature
+        probs = F.softmax(logits, dim=-1)
+        quantized = probs @ anchors
+        quantized = F.normalize(quantized.float(), dim=-1)
+        return quantized, probs
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         if hasattr(self.model, "gradient_checkpointing_enable"):
@@ -357,6 +382,8 @@ class DecoderLatentAlignmentModel(nn.Module):
 
         decoder_latent = F.normalize(decoder_latent.float(), dim=-1)
         vision_latent = F.normalize(vision_latent.float(), dim=-1).detach()
+        image_anchor_latent, image_anchor_probs = self.quantize_with_anchors(vision_latent)
+        decoder_anchor_latent, decoder_anchor_probs = self.quantize_with_anchors(decoder_latent)
 
         pair_embeddings = torch.cat([decoder_latent, vision_latent], dim=0)
         pair_labels = torch.arange(decoder_latent.size(0), device=decoder_latent.device).repeat(2)
@@ -367,6 +394,28 @@ class DecoderLatentAlignmentModel(nn.Module):
         coverage = coverage_loss(decoder_latent)
         cosine = 1.0 - F.cosine_similarity(decoder_latent, vision_latent, dim=-1).mean()
         token_alignment = token_level_alignment_loss(token_latents, vision_latent, attention_mask)
+        anchor_distribution = 0.5 * (
+            F.kl_div(
+                decoder_anchor_probs.clamp_min(1e-8).log(),
+                image_anchor_probs.detach(),
+                reduction="batchmean",
+            )
+            + F.kl_div(
+                image_anchor_probs.clamp_min(1e-8).log(),
+                decoder_anchor_probs.detach(),
+                reduction="batchmean",
+            )
+        )
+        quantized_anchor = 1.0 - F.cosine_similarity(
+            decoder_anchor_latent,
+            image_anchor_latent.detach(),
+            dim=-1,
+        ).mean()
+        anchor_commitment = (
+            F.mse_loss(decoder_latent, decoder_anchor_latent.detach())
+            + F.mse_loss(vision_latent, image_anchor_latent.detach())
+        )
+        usage = anchor_usage_loss(image_anchor_probs, decoder_anchor_probs)
         loss = (
             infonce
             + proxy_anchor
@@ -374,6 +423,10 @@ class DecoderLatentAlignmentModel(nn.Module):
             + 0.1 * coverage
             + cosine
             + 0.1 * token_alignment
+            + 0.05 * anchor_distribution
+            + 0.05 * quantized_anchor
+            + 0.01 * anchor_commitment
+            + 0.01 * usage
         )
 
         return {
@@ -384,6 +437,10 @@ class DecoderLatentAlignmentModel(nn.Module):
             "coverage_loss": coverage.detach(),
             "cosine_loss": cosine.detach(),
             "token_alignment_loss": token_alignment.detach(),
+            "anchor_distribution_loss": anchor_distribution.detach(),
+            "quantized_anchor_loss": quantized_anchor.detach(),
+            "anchor_commitment_loss": anchor_commitment.detach(),
+            "anchor_usage_loss": usage.detach(),
         }
 
 
