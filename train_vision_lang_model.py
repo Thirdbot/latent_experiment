@@ -36,14 +36,14 @@ LABEL_MAP = {
 }
 
 LABEL_ANSWER_MAP = {
-    "Boring": "Boring. The image lacks a distinct amplitude anomaly, reflector offset, or clear channel-like geometry.",
-    "Bright_Planar": "Bright_Planar. The image shows strong amplitudes arranged along relatively continuous planar reflectors.",
-    "Bright_Chaotic": "Bright_Chaotic. The image shows high-amplitude reflections with chaotic texture and poor reflector continuity.",
-    "Channel": "Channel. The image shows curved or incised reflector geometry consistent with a channel-like feature.",
-    "Converging_Amplitudes": "Converging_Amplitudes. The image shows reflector amplitudes that narrow or converge across the section.",
-    "Fault": "Fault. The image shows disrupted reflector continuity with offset-like geometry across a narrow zone.",
-    "Salt": "Salt. The image shows a low-continuity body with chaotic or transparent seismic character around it.",
-    "Transparent_Planar": "Transparent_Planar. The image shows weak amplitudes with planar layering and relatively transparent character.",
+    "Boring": "Boring.",
+    "Bright_Planar": "Bright_Planar.",
+    "Bright_Chaotic": "Bright_Chaotic.",
+    "Channel": "Channel.",
+    "Converging_Amplitudes": "Converging_Amplitudes.",
+    "Fault": "Fault.",
+    "Salt": "Salt.",
+    "Transparent_Planar": "Transparent_Planar.",
 }
 
 SEISMIC_CONCEPTS = [
@@ -234,6 +234,17 @@ def build_language_codebook(vlm, tokenizer, concepts):
     return F.normalize(torch.stack(vectors, dim=0), dim=-1)
 
 
+def paired_infonce_loss(image_latent, decoder_latent, temperature=0.07):
+    if image_latent.size(0) < 2:
+        return image_latent.new_zeros(())
+
+    image_latent = F.normalize(image_latent.float(), dim=-1)
+    decoder_latent = F.normalize(decoder_latent.float(), dim=-1)
+    logits = image_latent @ decoder_latent.T / temperature
+    labels = torch.arange(image_latent.size(0), device=image_latent.device)
+    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+
+
 class ConceptQuantizationCollator:
     def __init__(self, model, processor):
         self.base_collator = UnslothVisionDataCollator(model, processor)
@@ -375,6 +386,7 @@ class ConceptQuantizedVLM(nn.Module):
         decoder_vision_loss = 1.0 - F.cosine_similarity(fused_decoder_latent, qwen_vision_latent.detach(), dim=-1).mean()
         image_concept_loss = 1.0 - F.cosine_similarity(qwen_vision_latent, concept_latent, dim=-1).mean()
         decoder_concept_loss = 1.0 - F.cosine_similarity(fused_decoder_latent, concept_latent.detach(), dim=-1).mean()
+        infonce_loss = paired_infonce_loss(qwen_vision_latent, fused_decoder_latent)
         concept_entropy_loss = -(concept_weights * concept_weights.clamp_min(1e-8).log()).sum(dim=-1).mean()
         if concept_labels is not None:
             concept_labels = concept_labels.to(concept_logits.device, dtype=concept_logits.dtype)
@@ -388,6 +400,7 @@ class ConceptQuantizedVLM(nn.Module):
             + 0.12 * image_concept_loss
             + 0.12 * decoder_concept_loss
             + 0.08 * concept_supervision_loss
+            + 0.03 * infonce_loss
             + 0.01 * concept_entropy_loss
         )
 
@@ -399,6 +412,7 @@ class ConceptQuantizedVLM(nn.Module):
             "image_concept_loss": image_concept_loss.detach(),
             "decoder_concept_loss": decoder_concept_loss.detach(),
             "concept_supervision_loss": concept_supervision_loss.detach(),
+            "infonce_loss": infonce_loss.detach(),
             "concept_entropy_loss": concept_entropy_loss.detach(),
         }
 
