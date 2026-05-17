@@ -1,13 +1,16 @@
 from pathlib import Path
-import os
-from datasets import load_dataset
+
 import torch
+from datasets import load_dataset
+from peft import PeftModel
+from pytorch_metric_learning.losses import NTXentLoss, NormalizedSoftmaxLoss, ProxyAnchorLoss
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
-from unsloth import FastVisionModel, UnslothVisionDataCollator, is_bfloat16_supported
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
+from unsloth import FastVisionModel, UnslothVisionDataCollator, is_bfloat16_supported
+
 
 MODEL_NAME = "unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit"
 
@@ -23,6 +26,7 @@ INSTRUCTION = (
 )
 
 OUTPUT_DIR = Path("outputs/vision_llm_trained")
+CUSTOM_OUTPUT_DIR = Path("outputs/vision_llm_trained_custom")
 
 LABEL_MAP = {
     0: "Boring",
@@ -34,49 +38,6 @@ LABEL_MAP = {
     6: "Salt",
     7: "Transparent_Planar",
 }
-
-LABEL_ANSWER_MAP = {
-    "Boring": "Boring.",
-    "Bright_Planar": "Bright_Planar.",
-    "Bright_Chaotic": "Bright_Chaotic.",
-    "Channel": "Channel.",
-    "Converging_Amplitudes": "Converging_Amplitudes.",
-    "Fault": "Fault.",
-    "Salt": "Salt.",
-    "Transparent_Planar": "Transparent_Planar.",
-}
-
-SEISMIC_CONCEPTS = [
-    "low contrast",
-    "high amplitude",
-    "weak amplitude",
-    "chaotic texture",
-    "planar reflectors",
-    "continuous reflectors",
-    "poor reflector continuity",
-    "disrupted reflectors",
-    "offset geometry",
-    "curved geometry",
-    "incised channel",
-    "converging amplitudes",
-    "transparent character",
-    "salt body",
-    "layered structure",
-    "amplitude anomaly",
-]
-
-LABEL_CONCEPT_MAP = {
-    "Boring": ["low contrast", "weak amplitude"],
-    "Bright_Planar": ["high amplitude", "planar reflectors", "continuous reflectors"],
-    "Bright_Chaotic": ["high amplitude", "chaotic texture", "poor reflector continuity"],
-    "Channel": ["curved geometry", "incised channel"],
-    "Converging_Amplitudes": ["converging amplitudes", "amplitude anomaly"],
-    "Fault": ["disrupted reflectors", "offset geometry", "poor reflector continuity"],
-    "Salt": ["salt body", "chaotic texture", "transparent character"],
-    "Transparent_Planar": ["weak amplitude", "transparent character", "planar reflectors"],
-}
-
-CONCEPT_INDEX = {concept: index for index, concept in enumerate(SEISMIC_CONCEPTS)}
 
 
 def latest_checkpoint(output_dir):
@@ -95,45 +56,55 @@ class SeismicConversationDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.dataset[index]
-        label = LABEL_MAP[sample["label"]]
+        label = LABEL_MAP[int(sample["label"])]
         image = sample["image"].convert("RGB")
-        concept_labels = torch.zeros(len(SEISMIC_CONCEPTS), dtype=torch.float32)
-        for concept in LABEL_CONCEPT_MAP[label]:
-            concept_labels[CONCEPT_INDEX[concept]] = 1.0
         return {
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": INSTRUCTION},
                         {"type": "image"},
+                        {"type": "text", "text": INSTRUCTION},
                     ],
                 },
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "text", "text": LABEL_ANSWER_MAP[label]},
+                        {"type": "text", "text": label},
                     ],
                 },
             ],
             "images": [image],
-            "concept_labels": concept_labels,
+        }
+
+
+class SeismicImageDataset(Dataset):
+    def __init__(self, split):
+        self.dataset = load_dataset("thinkonward/reflection-connection", split=split)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        sample = self.dataset[index]
+        return {
+            "image": sample["image"].convert("RGB"),
+            "label": int(sample["label"]),
         }
 
 
 def load_unsloth_vision_model(model_name=MODEL_NAME):
-    model, processor = FastVisionModel.from_pretrained(
+    return FastVisionModel.from_pretrained(
         model_name,
         load_in_4bit=True,
         use_gradient_checkpointing="unsloth",
     )
-    return model, processor
 
 
 def print_one_eval_example(model, processor, split="test", index=0):
     dataset = load_dataset("thinkonward/reflection-connection", split=split)
     sample = dataset[index]
-    label = LABEL_MAP[sample["label"]]
+    label = LABEL_MAP[int(sample["label"])]
     image = sample["image"].convert("RGB")
     image_path = sample.get("image_path") or sample.get("path") or f"{split}[{index}]"
 
@@ -166,7 +137,7 @@ def print_one_eval_example(model, processor, split="test", index=0):
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=48,
+            max_new_tokens=80,
             do_sample=False,
             repetition_penalty=1.25,
             no_repeat_ngram_size=3,
@@ -209,215 +180,214 @@ def get_image_token_id(model, processor):
     raise ValueError("Could not infer Qwen image token id.")
 
 
-def get_assistant_token_mask(input_ids, labels, attention_mask=None):
-    if labels is not None:
-        mask = labels.ne(-100)
-    elif attention_mask is not None:
-        mask = attention_mask.bool()
-    else:
-        mask = torch.ones_like(input_ids, dtype=torch.bool)
-    return mask
+def coverage_loss(embeddings):
+    if embeddings.size(0) < 2:
+        return embeddings.new_zeros(())
+
+    embeddings = F.normalize(embeddings.float(), dim=-1)
+    similarity = embeddings @ embeddings.T
+    off_diagonal = similarity[
+        ~torch.eye(similarity.size(0), dtype=torch.bool, device=similarity.device)
+    ]
+    return off_diagonal.pow(2).mean()
 
 
-def build_language_codebook(vlm, tokenizer, concepts):
-    embedding_layer = vlm.get_input_embeddings()
-    embedding_weight = embedding_layer.weight.detach()
-    vectors = []
-    for concept in concepts:
-        token_ids = tokenizer(
-            concept,
-            add_special_tokens=False,
-            return_tensors="pt",
-        ).input_ids.to(embedding_weight.device)
-        concept_vector = embedding_weight.index_select(0, token_ids[0]).mean(dim=0)
-        vectors.append(concept_vector.float())
-    return F.normalize(torch.stack(vectors, dim=0), dim=-1)
+def token_level_alignment_loss(token_latents, vision_latent, attention_mask=None):
+    token_latents = F.normalize(token_latents.float(), dim=-1)
+    vision_latent = F.normalize(vision_latent.float(), dim=-1)
+    distances = 1.0 - F.cosine_similarity(token_latents, vision_latent.unsqueeze(1), dim=-1)
+
+    if attention_mask is None:
+        return distances.mean()
+
+    mask = attention_mask.to(distances.device, dtype=distances.dtype)
+    return (distances * mask).sum() / mask.sum().clamp_min(1.0)
 
 
-def paired_infonce_loss(image_latent, decoder_latent, temperature=0.07):
-    if image_latent.size(0) < 2:
-        return image_latent.new_zeros(())
-
-    image_latent = F.normalize(image_latent.float(), dim=-1)
-    decoder_latent = F.normalize(decoder_latent.float(), dim=-1)
-    logits = image_latent @ decoder_latent.T / temperature
-    labels = torch.arange(image_latent.size(0), device=image_latent.device)
-    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
-
-
-class ConceptQuantizationCollator:
-    def __init__(self, model, processor):
-        self.base_collator = UnslothVisionDataCollator(model, processor)
+class DecoderLatentCollator:
+    def __init__(self, processor):
+        self.processor = processor
 
     def __call__(self, examples):
-        base_examples = [
-            {
-                "messages": example["messages"],
-                "images": example["images"],
-            }
-            for example in examples
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": INSTRUCTION},
+                    ],
+                }
+            ]
+            for _ in examples
         ]
-        batch = self.base_collator(base_examples)
-        batch["concept_labels"] = torch.stack([example["concept_labels"] for example in examples])
-        return batch
+        prompts = [
+            self.processor.apply_chat_template(
+                message,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            for message in messages
+        ]
+        inputs = self.processor(
+            text=prompts,
+            images=[[example["image"]] for example in examples],
+            return_tensors="pt",
+            padding=True,
+        )
+        inputs["metric_labels"] = torch.tensor(
+            [example["label"] for example in examples],
+            dtype=torch.long,
+        )
+        return inputs
 
 
-class ConceptQuantizedVLM(nn.Module):
-    def __init__(self, vlm, processor, latent_dim=512):
+class DecoderLatentAlignmentModel(nn.Module):
+    def __init__(self, model_name=MODEL_NAME, vision_adapter_path=OUTPUT_DIR / "final", latent_dim=512):
         super().__init__()
-        self.vlm = vlm
-        self.processor = processor
-        self.image_token_id = get_image_token_id(vlm, processor)
 
-        vlm_hidden_size = get_hidden_size(vlm)
-        self.vlm_vision_projector = nn.Linear(vlm_hidden_size, latent_dim)
-        self.decoder_projector = nn.Linear(vlm_hidden_size, latent_dim)
-        self.concept_query_projector = nn.Linear(vlm_hidden_size, vlm_hidden_size)
-        self.concept_projector = nn.Linear(vlm_hidden_size, latent_dim)
-        self.decoder_to_vision_gate = nn.Sequential(
-            nn.Linear(latent_dim * 3, latent_dim),
-            nn.SiLU(),
-            nn.Linear(latent_dim, latent_dim),
-        )
-        self.concept_temperature = 0.07
-        self.register_buffer(
-            "language_codebook",
-            build_language_codebook(vlm, processor.tokenizer, SEISMIC_CONCEPTS),
-            persistent=True,
+        self.model, self.processor = load_unsloth_vision_model(model_name)
+        vision_adapter_path = Path(vision_adapter_path)
+        if vision_adapter_path.exists():
+            print(f"loaded frozen vision adapter from {vision_adapter_path}")
+            vision_model = PeftModel.from_pretrained(
+                self.model,
+                vision_adapter_path.as_posix(),
+                is_trainable=False,
+            )
+            self.model = vision_model.merge_and_unload()
+            print("merged vision adapter into base model before adding decoder adapter")
+        else:
+            print(f"vision adapter not found at {vision_adapter_path}; using frozen base vision tower")
+
+        self.model = FastVisionModel.get_peft_model(
+            self.model,
+            finetune_vision_layers=False,
+            finetune_language_layers=True,
+            finetune_attention_modules=True,
+            finetune_mlp_modules=False,
+            r=16,
+            lora_alpha=16,
+            lora_dropout=0.0,
+            bias="none",
+            random_state=3407,
+            use_rslora=False,
+            loftq_config=None,
+            target_modules="all-linear",
         )
 
-    def print_trainable_parameters(self):
-        if hasattr(self.vlm, "print_trainable_parameters"):
-            self.vlm.print_trainable_parameters()
+        for name, param in self.model.named_parameters():
+            if "visual" in name or "vision" in name or "merger" in name:
+                param.requires_grad = False
+            if "lm_head" in name or "embed_tokens" in name:
+                param.requires_grad = False
+
+        hidden_size = get_hidden_size(self.model)
+        self.image_token_id = get_image_token_id(self.model, self.processor)
+        self.decoder_projector = nn.Linear(hidden_size, latent_dim)
+        self.vision_projector = nn.Linear(hidden_size, latent_dim)
+
+        for param in self.vision_projector.parameters():
+            param.requires_grad = False
+        for param in self.decoder_projector.parameters():
+            param.requires_grad = True
+
+        self.infonce_loss = NTXentLoss(temperature=0.07)
+        self.proxy_anchor_loss = ProxyAnchorLoss(
+            num_classes=len(LABEL_MAP),
+            embedding_size=latent_dim,
+        )
+        self.metric_softmax_loss = NormalizedSoftmaxLoss(
+            num_classes=len(LABEL_MAP),
+            embedding_size=latent_dim,
+        )
+
+        self.model.print_trainable_parameters()
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        if hasattr(self.vlm, "gradient_checkpointing_enable"):
+        if hasattr(self.model, "gradient_checkpointing_enable"):
             if gradient_checkpointing_kwargs is None:
-                self.vlm.gradient_checkpointing_enable()
+                self.model.gradient_checkpointing_enable()
             else:
-                self.vlm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+                self.model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+                )
 
     def gradient_checkpointing_disable(self):
-        if hasattr(self.vlm, "gradient_checkpointing_disable"):
-            self.vlm.gradient_checkpointing_disable()
+        if hasattr(self.model, "gradient_checkpointing_disable"):
+            self.model.gradient_checkpointing_disable()
 
     def enable_input_require_grads(self):
-        if hasattr(self.vlm, "enable_input_require_grads"):
-            self.vlm.enable_input_require_grads()
+        if hasattr(self.model, "enable_input_require_grads"):
+            self.model.enable_input_require_grads()
 
     def save_pretrained(self, output_dir):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        self.vlm.save_pretrained(output_dir)
-        torch.save(
-            {
-                "vlm_vision_projector": self.vlm_vision_projector.state_dict(),
-                "decoder_projector": self.decoder_projector.state_dict(),
-                "concept_query_projector": self.concept_query_projector.state_dict(),
-                "concept_projector": self.concept_projector.state_dict(),
-                "decoder_to_vision_gate": self.decoder_to_vision_gate.state_dict(),
-                "language_codebook": self.language_codebook.detach().cpu(),
-                "seismic_concepts": SEISMIC_CONCEPTS,
-            },
-            output_dir / "concept_quantizer_heads.pt",
-        )
+        self.model.save_pretrained(output_dir)
         torch.save(self.state_dict(), output_dir / "pytorch_model.bin")
 
-    def _pool_by_mask(self, hidden_states, mask):
+    def pool_by_mask(self, hidden_states, mask):
         mask = mask.to(hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
         return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
 
-    def _language_quantize(self, qwen_vision_hidden):
-        qwen_vision_hidden = qwen_vision_hidden.to(dtype=self.concept_query_projector.weight.dtype)
-        concept_query = self.concept_query_projector(qwen_vision_hidden)
-        concept_query = F.normalize(concept_query.float(), dim=-1)
-        codebook = F.normalize(self.language_codebook.to(concept_query.device), dim=-1)
-        concept_logits = concept_query @ codebook.T / self.concept_temperature
-        concept_weights = F.softmax(concept_logits, dim=-1)
-        quantized_hidden = concept_weights @ codebook
-        quantized_hidden = quantized_hidden.to(dtype=self.concept_projector.weight.dtype)
-        concept_latent = F.normalize(self.concept_projector(quantized_hidden).float(), dim=-1)
-        return concept_latent, concept_logits, concept_weights
+    def forward(self, metric_labels=None, **inputs):
+        attention_mask = inputs.get("attention_mask")
 
-    def top_concepts(self, qwen_vision_hidden, k=4):
-        _, _, concept_weights = self._language_quantize(qwen_vision_hidden)
-        scores, indices = concept_weights.topk(k=min(k, concept_weights.size(-1)), dim=-1)
-        return [
-            [(SEISMIC_CONCEPTS[index], float(score)) for score, index in zip(row_scores, row_indices)]
-            for row_scores, row_indices in zip(scores.detach().cpu(), indices.detach().cpu())
-        ]
-
-    def forward(self, concept_labels=None, **inputs):
-        outputs = self.vlm(
+        outputs = self.model(
             **inputs,
             output_hidden_states=True,
             return_dict=True,
             use_cache=False,
         )
         hidden_states = outputs.hidden_states[-1]
-        attention_mask = inputs.get("attention_mask")
-        input_ids = inputs["input_ids"]
-        labels = inputs.get("labels")
+        image_mask = inputs["input_ids"].eq(self.image_token_id)
+        decoder_mask = attention_mask.bool() & ~image_mask if attention_mask is not None else ~image_mask
 
-        image_mask = input_ids.eq(self.image_token_id)
-        assistant_mask = get_assistant_token_mask(input_ids, labels, attention_mask)
-        if attention_mask is not None:
-            assistant_mask = assistant_mask & attention_mask.bool()
+        with torch.no_grad():
+            vision_hidden = self.pool_by_mask(hidden_states.detach(), image_mask)
+            vision_hidden = vision_hidden.to(dtype=self.vision_projector.weight.dtype)
+            vision_latent = self.vision_projector(vision_hidden)
 
-        qwen_vision_hidden = self._pool_by_mask(hidden_states, image_mask)
-        decoder_hidden = self._pool_by_mask(hidden_states, assistant_mask)
-
-        qwen_vision_hidden = qwen_vision_hidden.to(dtype=self.vlm_vision_projector.weight.dtype)
+        decoder_hidden = self.pool_by_mask(hidden_states, decoder_mask)
         decoder_hidden = decoder_hidden.to(dtype=self.decoder_projector.weight.dtype)
-        qwen_vision_latent = F.normalize(self.vlm_vision_projector(qwen_vision_hidden).float(), dim=-1)
-        decoder_latent = F.normalize(self.decoder_projector(decoder_hidden).float(), dim=-1)
-        concept_latent, concept_logits, concept_weights = self._language_quantize(qwen_vision_hidden)
+        decoder_latent = self.decoder_projector(decoder_hidden)
+        token_hidden = hidden_states.to(dtype=self.decoder_projector.weight.dtype)
+        token_latents = self.decoder_projector(token_hidden)
 
-        fused_decoder_latent = F.normalize(
-            self.decoder_to_vision_gate(
-                torch.cat([decoder_latent, qwen_vision_latent.detach(), concept_latent.detach()], dim=-1).to(
-                    dtype=self.decoder_to_vision_gate[0].weight.dtype
-                )
-            ).float(),
-            dim=-1,
-        )
+        decoder_latent = F.normalize(decoder_latent.float(), dim=-1)
+        vision_latent = F.normalize(vision_latent.float(), dim=-1).detach()
 
-        ce_loss = outputs.loss
-        decoder_vision_loss = 1.0 - F.cosine_similarity(fused_decoder_latent, qwen_vision_latent.detach(), dim=-1).mean()
-        image_concept_loss = 1.0 - F.cosine_similarity(qwen_vision_latent, concept_latent, dim=-1).mean()
-        decoder_concept_loss = 1.0 - F.cosine_similarity(fused_decoder_latent, concept_latent.detach(), dim=-1).mean()
-        infonce_loss = paired_infonce_loss(qwen_vision_latent, fused_decoder_latent)
-        concept_entropy_loss = -(concept_weights * concept_weights.clamp_min(1e-8).log()).sum(dim=-1).mean()
-        if concept_labels is not None:
-            concept_labels = concept_labels.to(concept_logits.device, dtype=concept_logits.dtype)
-            concept_supervision_loss = F.binary_cross_entropy_with_logits(concept_logits, concept_labels)
-        else:
-            concept_supervision_loss = ce_loss.new_zeros(())
+        pair_embeddings = torch.cat([decoder_latent, vision_latent], dim=0)
+        pair_labels = torch.arange(decoder_latent.size(0), device=decoder_latent.device).repeat(2)
 
+        infonce = self.infonce_loss(pair_embeddings, pair_labels)
+        proxy_anchor = self.proxy_anchor_loss(decoder_latent, metric_labels)
+        metric_cross_entropy = self.metric_softmax_loss(decoder_latent, metric_labels)
+        coverage = coverage_loss(decoder_latent)
+        cosine = 1.0 - F.cosine_similarity(decoder_latent, vision_latent, dim=-1).mean()
+        token_alignment = token_level_alignment_loss(token_latents, vision_latent, attention_mask)
         loss = (
-            ce_loss
-            + 0.08 * decoder_vision_loss
-            + 0.12 * image_concept_loss
-            + 0.12 * decoder_concept_loss
-            + 0.08 * concept_supervision_loss
-            + 0.03 * infonce_loss
-            + 0.01 * concept_entropy_loss
+            infonce
+            + proxy_anchor
+            + metric_cross_entropy
+            + 0.1 * coverage
+            + cosine
+            + 0.1 * token_alignment
         )
 
         return {
             "loss": loss,
-            "logits": outputs.logits,
-            "ce_loss": ce_loss.detach(),
-            "decoder_vision_loss": decoder_vision_loss.detach(),
-            "image_concept_loss": image_concept_loss.detach(),
-            "decoder_concept_loss": decoder_concept_loss.detach(),
-            "concept_supervision_loss": concept_supervision_loss.detach(),
-            "infonce_loss": infonce_loss.detach(),
-            "concept_entropy_loss": concept_entropy_loss.detach(),
+            "infonce_loss": infonce.detach(),
+            "proxy_anchor_loss": proxy_anchor.detach(),
+            "metric_cross_entropy_loss": metric_cross_entropy.detach(),
+            "coverage_loss": coverage.detach(),
+            "cosine_loss": cosine.detach(),
+            "token_alignment_loss": token_alignment.detach(),
         }
 
 
-class ConceptQuantizedTrainer(Trainer):
+class LatentAlignmentTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs["loss"]
@@ -431,11 +401,11 @@ class ConceptQuantizedTrainer(Trainer):
 
 
 def train_decoder_with_label():
-    vlm, processor = load_unsloth_vision_model(MODEL_NAME)
-    vlm = FastVisionModel.get_peft_model(
-        vlm,
+    model, processor = load_unsloth_vision_model(MODEL_NAME)
+    model = FastVisionModel.get_peft_model(
+        model,
         finetune_vision_layers=True,
-        finetune_language_layers=True,
+        finetune_language_layers=False,
         finetune_attention_modules=True,
         finetune_mlp_modules=True,
         r=16,
@@ -447,8 +417,6 @@ def train_decoder_with_label():
         loftq_config=None,
         target_modules="all-linear",
     )
-    model = ConceptQuantizedVLM(vlm, processor)
-    model.print_trainable_parameters()
 
     train_dataset = SeismicConversationDataset("train")
     test_dataset = SeismicConversationDataset("test")
@@ -460,7 +428,7 @@ def train_decoder_with_label():
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=4,
-        num_train_epochs=3,
+        num_train_epochs=1,
         weight_decay=0.02,
         warmup_steps=50,
         gradient_checkpointing=True,
@@ -475,12 +443,12 @@ def train_decoder_with_label():
         fp16=not is_bfloat16_supported(),
     )
 
-    trainer = ConceptQuantizedTrainer(
+    trainer = Trainer(
         model=model,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         args=args,
-        data_collator=ConceptQuantizationCollator(vlm, processor),
+        data_collator=UnslothVisionDataCollator(model, processor),
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=2,
@@ -492,33 +460,91 @@ def train_decoder_with_label():
     trainer.evaluate()
     trainer.save_model((OUTPUT_DIR / "final").as_posix())
     processor.save_pretrained((OUTPUT_DIR / "final").as_posix())
-    print_one_eval_example(model.vlm, processor)
+    print_one_eval_example(model, processor)
+
+
+def train_decoder_without_label():
+    model = DecoderLatentAlignmentModel(
+        model_name=MODEL_NAME,
+        vision_adapter_path=OUTPUT_DIR / "final",
+    )
+    processor = model.processor
+
+    train_dataset = SeismicImageDataset("train")
+    eval_dataset = SeismicImageDataset("test")
+
+    args = TrainingArguments(
+        output_dir=CUSTOM_OUTPUT_DIR.as_posix(),
+        logging_dir="logs",
+        learning_rate=1e-4,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
+        gradient_accumulation_steps=4,
+        num_train_epochs=4,
+        weight_decay=0.02,
+        warmup_steps=25,
+        gradient_checkpointing=True,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=False,
+        save_total_limit=2,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        remove_unused_columns=False,
+        prediction_loss_only=True,
+        bf16=is_bfloat16_supported(),
+        fp16=not is_bfloat16_supported(),
+    )
+
+    trainer = LatentAlignmentTrainer(
+        model=model,
+        args=args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=DecoderLatentCollator(processor),
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=2,
+                early_stopping_threshold=0.001,
+            )
+        ],
+    )
+
+    trainer.train(resume_from_checkpoint=latest_checkpoint(CUSTOM_OUTPUT_DIR))
+    trainer.evaluate()
+    trainer.save_model((CUSTOM_OUTPUT_DIR / "final").as_posix())
+    print_one_eval_example(model.model, processor)
+
 
 def main():
     train_decoder_with_label()
-# train using unsloth
-# custom loss only for decoder layer
+    train_decoder_without_label()
+
+
 def test_understanding():
     test_dataset = load_dataset("thinkonward/reflection-connection", split="test")
     model, processor = load_unsloth_vision_model(MODEL_NAME)
-    # test knowledge
+    if (OUTPUT_DIR / "final").exists():
+        model = PeftModel.from_pretrained(model, (OUTPUT_DIR / "final").as_posix(), is_trainable=False)
+
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image"},
-                {"type": "text", "text": INSTRUCTION}
-            ]
+                {"type": "text", "text": INSTRUCTION},
+            ],
         },
     ]
-    prompt = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True
-    )
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
     selected_data = test_dataset[10]
-    label = LABEL_MAP[selected_data["label"]]
-    print("test: ",label)
-    inputs = processor(text=prompt, images=[selected_data["image"].convert("RGB")], return_tensors="pt")
+    label = LABEL_MAP[int(selected_data["label"])]
+    print("test:", label)
+    inputs = processor(
+        text=prompt,
+        images=[selected_data["image"].convert("RGB")],
+        return_tensors="pt",
+    )
     device = next(model.parameters()).device
     inputs = {
         key: value.to(device) if hasattr(value, "to") else value
@@ -539,11 +565,7 @@ def test_understanding():
 
     print(generated_texts[0])
 
+
 if __name__ == "__main__":
     main()
     # test_understanding()
-# 1. test model checked (not so good)
-# 1.1 train decoder and vision-adapter (not mess with encoder because need shape and texture understanding) on label, maybe it can generate description
-# 2. train model with custom loss to ensure in-topic generation with label (train just dec)
-# 3. using finetune-vision that able to give out label (classification head output token?) wiring that to decoder instead for decoder only train without label
-# introducing some new mechanics
