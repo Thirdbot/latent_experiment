@@ -16,5 +16,5 @@ dependencies = [
     "torchvision>=0.27.0",
     "transformers>=5.8.1",
     "trl>=1.4.0",
-    "unsloth>=2026.5.2",
+    "unsloth>=2026.5.0",
 ]
