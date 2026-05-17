@@ -5,6 +5,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
+from transformers.trainer_utils import get_last_checkpoint
 from peft import PeftModel
 from pytorch_metric_learning.losses import NTXentLoss, NormalizedSoftmaxLoss, ProxyAnchorLoss
 from unsloth import FastVisionModel, UnslothVisionDataCollator, is_bfloat16_supported
@@ -24,6 +25,7 @@ INSTRUCTION = (
 
 OUTPUT_DIR = Path("outputs/vision_llm_trained")
 CUSTOM_OUTPUT_DIR = Path("outputs/vision_llm_trained_custom")
+DISTILL_OUTPUT_DIR = Path("outputs/vision_llm_distilled")
 DOMAIN_WORDS = [
     "reflector",
     "reflectors",
@@ -55,6 +57,13 @@ LABEL_MAP = {
     6: "Salt",
     7: "Transparent_Planar",
 }
+
+
+def latest_checkpoint(output_dir):
+    output_dir = Path(output_dir)
+    if not output_dir.exists():
+        return None
+    return get_last_checkpoint(output_dir.as_posix())
 
 
 class SeismicConversationDataset(Dataset):
@@ -393,13 +402,7 @@ class DecoderLatentAlignmentModel(nn.Module):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         self.model.save_pretrained(output_dir)
-        torch.save(
-            {
-                "decoder_projector": self.decoder_projector.state_dict(),
-                "vision_projector": self.vision_projector.state_dict(),
-            },
-            output_dir / "projectors.pt",
-        )
+        torch.save(self.state_dict(), output_dir / "pytorch_model.bin")
 
     def get_eos_token_id(self):
         generation_config = getattr(self.model, "generation_config", None)
@@ -551,7 +554,7 @@ def train_decoder_with_label():
             )
         ],
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=latest_checkpoint(OUTPUT_DIR))
     trainer.evaluate()
     trainer.save_model((OUTPUT_DIR / "final").as_posix())
 
@@ -572,7 +575,7 @@ def train_decoder_without_label():
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
         gradient_accumulation_steps=4,
-        num_train_epochs=3,
+        num_train_epochs=4,
         weight_decay=0.02,
         warmup_steps=25,
         eval_strategy="epoch",
@@ -599,7 +602,7 @@ def train_decoder_without_label():
         ],
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=latest_checkpoint(CUSTOM_OUTPUT_DIR))
     trainer.evaluate()
     trainer.save_model((CUSTOM_OUTPUT_DIR / "final").as_posix())
     print_one_eval_example(model.model, processor)
