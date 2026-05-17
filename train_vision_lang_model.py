@@ -4,17 +4,23 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
-from transformers import AutoModelForImageTextToText, AutoProcessor, EarlyStoppingCallback, Trainer, TrainingArguments
-from peft import LoraConfig, PeftModel, get_peft_model
-from trl import SFTConfig, SFTTrainer
+from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
+from peft import PeftModel
 from pytorch_metric_learning.losses import NTXentLoss, NormalizedSoftmaxLoss, ProxyAnchorLoss
+from unsloth import FastVisionModel, UnslothVisionDataCollator, is_bfloat16_supported
 
-MODEL_NAME = "HuggingFaceTB/SmolVLM-Instruct"
+MODEL_NAME = "unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit"
 
-INSTRUCTION = "You are an expert geophysicist.Using only these  Classify this seismic reflection image using one of: \
-        (Boring, Bright_Planar, Bright_Chaotic, Channel, Converging_Amplitudes, Fault, Salt, Transparent_Planar). \
-        Then give 2-3 short visual reasons based only on visible patterns. Do not invent details. \
-        Describe accurately what you see in this image."
+INSTRUCTION = (
+    "You are an expert geophysicist interpreting seismic reflection images. "
+    "Classify the image using exactly one of: Boring, Bright_Planar, Bright_Chaotic, "
+    "Channel, Converging_Amplitudes, Fault, Salt, Transparent_Planar. "
+    "Answer in exactly two concise sentences. "
+    "Sentence 1: <Class>. "
+    "Sentence 2: Give one specific visible reason using seismic terms such as reflector "
+    "continuity, amplitude, geometry, offset, chaos, or transparency. "
+    "Do not use markdown, bullets, numbering, uncertainty language, or extra explanation."
+)
 
 OUTPUT_DIR = Path("outputs/vision_llm_trained")
 CUSTOM_OUTPUT_DIR = Path("outputs/vision_llm_trained_custom")
@@ -97,87 +103,13 @@ class SeismicImageDataset(Dataset):
         }
 
 
-class VisionClassifierCollator:
-    def __init__(self, processor):
-        self.processor = processor
-
-    def __call__(self, examples):
-        inputs = self.processor(
-            images=[example["image"] for example in examples],
-            return_tensors="pt",
-            padding=True,
-        )
-        inputs["labels"] = torch.tensor(
-            [example["label"] for example in examples],
-            dtype=torch.long,
-        )
-        return inputs
-
-
-class VisionAdapterClassifier(nn.Module):
-    def __init__(self, model_name=MODEL_NAME):
-        super().__init__()
-
-        model_kwargs = {}
-        if torch.cuda.is_available():
-            model_kwargs["torch_dtype"] = torch.bfloat16
-
-        base_model = AutoModelForImageTextToText.from_pretrained(model_name, **model_kwargs)
-        base_model.config.use_cache = False
-        if hasattr(base_model, "gradient_checkpointing_enable"):
-            base_model.gradient_checkpointing_enable()
-
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=16,
-            lora_dropout=0.0,
-            bias="none",
-            target_modules=r".*vision_model.*self_attn.*(q_proj|k_proj|v_proj|out_proj)$",
-        )
-        self.model = get_peft_model(base_model, lora_config)
-
-        for name, param in self.model.named_parameters():
-            param.requires_grad = "vision_model" in name and "lora_" in name
-
-        hidden_size = self.model.base_model.model.config.vision_config.hidden_size
-        self.classifier = nn.Linear(hidden_size, len(LABEL_MAP))
-        self.model.print_trainable_parameters()
-
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
-            )
-
-    def gradient_checkpointing_disable(self):
-        if hasattr(self.model, "gradient_checkpointing_disable"):
-            self.model.gradient_checkpointing_disable()
-
-    def forward(self, pixel_values, labels=None, **kwargs):
-        if pixel_values.dim() == 5:
-            batch_size, num_images, channels, height, width = pixel_values.shape
-            pixel_values = pixel_values.reshape(batch_size * num_images, channels, height, width)
-        else:
-            batch_size = pixel_values.shape[0]
-            num_images = 1
-
-        vision_dtype = next(self.model.base_model.model.model.vision_model.parameters()).dtype
-        pixel_values = pixel_values.to(dtype=vision_dtype)
-        vision_outputs = self.model.base_model.model.model.vision_model(pixel_values=pixel_values)
-        pooled = vision_outputs.last_hidden_state.mean(dim=1)
-        pooled = pooled.reshape(batch_size, num_images, -1).mean(dim=1)
-        pooled = pooled.to(dtype=self.classifier.weight.dtype)
-        logits = self.classifier(pooled)
-
-        loss = None
-        if labels is not None:
-            loss = F.cross_entropy(logits.float(), labels.long())
-
-        return {"loss": loss, "logits": logits}
-
-    def save_pretrained(self, output_dir):
-        self.model.save_pretrained(output_dir)
-        torch.save(self.classifier.state_dict(), Path(output_dir) / "classifier_head.pt")
+def load_unsloth_vision_model(model_name=MODEL_NAME):
+    model, processor = FastVisionModel.from_pretrained(
+        model_name,
+        load_in_4bit=True,
+        use_gradient_checkpointing="unsloth",
+    )
+    return model, processor
 
 
 def print_one_eval_example(model, processor, split="test", index=0):
@@ -214,7 +146,13 @@ def print_one_eval_example(model, processor, split="test", index=0):
 
     model.eval()
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=80)
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=48,
+            do_sample=False,
+            repetition_penalty=1.25,
+            no_repeat_ngram_size=3,
+        )
     prompt_len = inputs["input_ids"].shape[-1]
     generated_text = processor.batch_decode(
         generated_ids[:, prompt_len:],
@@ -225,6 +163,32 @@ def print_one_eval_example(model, processor, split="test", index=0):
     print(f"source: {image_path}")
     print(f"label: {label}")
     print(f"generated: {generated_text}")
+
+
+def get_hidden_size(model):
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None and getattr(text_config, "hidden_size", None) is not None:
+        return text_config.hidden_size
+    if config is not None and getattr(config, "hidden_size", None) is not None:
+        return config.hidden_size
+    raise ValueError("Could not infer hidden_size from model config.")
+
+
+def get_image_token_id(model, processor):
+    config = getattr(model, "config", None)
+    for attr in ("image_token_id", "image_token_index"):
+        value = getattr(config, attr, None)
+        if value is not None:
+            return value
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    for token in ("<|image_pad|>", "<image>", "<|vision_start|>"):
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is not None and token_id != getattr(tokenizer, "unk_token_id", None):
+            return token_id
+
+    raise ValueError("Could not infer Qwen image token id.")
 
 
 class DecoderLatentCollator:
@@ -363,54 +327,47 @@ class DecoderLatentAlignmentModel(nn.Module):
     def __init__(self, model_name=MODEL_NAME, vision_adapter_path=OUTPUT_DIR / "final", latent_dim=512):
         super().__init__()
 
-        base_model = AutoModelForImageTextToText.from_pretrained(model_name)
+        self.model, self.processor = load_unsloth_vision_model(model_name)
         vision_adapter_path = Path(vision_adapter_path)
         if vision_adapter_path.exists():
+            print(f"loaded frozen vision adapter from {vision_adapter_path}")
             vision_model = PeftModel.from_pretrained(
-                base_model,
+                self.model,
                 vision_adapter_path.as_posix(),
-                adapter_name="vision_adapter",
                 is_trainable=False,
             )
-            print(f"loaded frozen vision adapter from {vision_adapter_path}")
             self.model = vision_model.merge_and_unload()
-            print("merged vision adapter into base model for decoder-adapter training")
+            print("merged vision adapter into base model before adding decoder adapter")
         else:
             print(f"vision adapter not found at {vision_adapter_path}; using frozen base vision tower")
-            self.model = base_model
 
-        decoder_lora_config = LoraConfig(
+        self.model = FastVisionModel.get_peft_model(
+            self.model,
+            finetune_vision_layers=False,
+            finetune_language_layers=True,
+            finetune_attention_modules=True,
+            finetune_mlp_modules=False,
             r=16,
             lora_alpha=16,
             lora_dropout=0.0,
             bias="none",
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            modules_to_save=["lm_head", "embed_tokens"],
+            random_state=3407,
+            use_rslora=False,
+            loftq_config=None,
+            target_modules="all-linear",
         )
-        self.model = get_peft_model(
-            self.model,
-            decoder_lora_config,
-            adapter_name="decoder_adapter",
-        )
-        self.model.set_adapter("decoder_adapter")
 
         for name, param in self.model.named_parameters():
-            param.requires_grad = "decoder_adapter" in name
-            if "vision_model" in name or "connector" in name:
+            if "visual" in name or "vision" in name or "merger" in name:
+                param.requires_grad = False
+            if "lm_head" in name or "embed_tokens" in name:
                 param.requires_grad = False
 
-        config = self.model.base_model.model.config
+        hidden_size = get_hidden_size(self.model)
+        self.image_token_id = get_image_token_id(self.model, self.processor)
         # latents
-        self.decoder_projector = nn.Linear(config.text_config.hidden_size, latent_dim)
-        self.vision_projector = nn.Linear(config.vision_config.hidden_size, latent_dim)
+        self.decoder_projector = nn.Linear(hidden_size, latent_dim)
+        self.vision_projector = nn.Linear(hidden_size, latent_dim)
 
         # skip vision encoder
         for param in self.vision_projector.parameters():
@@ -432,6 +389,18 @@ class DecoderLatentAlignmentModel(nn.Module):
 
         self.model.print_trainable_parameters()
 
+    def save_pretrained(self, output_dir):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(output_dir)
+        torch.save(
+            {
+                "decoder_projector": self.decoder_projector.state_dict(),
+                "vision_projector": self.vision_projector.state_dict(),
+            },
+            output_dir / "projectors.pt",
+        )
+
     def get_eos_token_id(self):
         generation_config = getattr(self.model, "generation_config", None)
         if generation_config is not None and getattr(generation_config, "eos_token_id", None) is not None:
@@ -449,33 +418,12 @@ class DecoderLatentAlignmentModel(nn.Module):
 
         return None
 
-    def encode_vision_target(self, pixel_values):
-        # batching or not
-        if pixel_values.dim() == 5:
-            batch_size, num_images, channels, height, width = pixel_values.shape
-            pixel_values = pixel_values.reshape(batch_size * num_images, channels, height, width)
-        else:
-            batch_size = pixel_values.shape[0]
-            num_images = 1
-        # project to latents
-        vision_dtype = next(self.model.base_model.model.model.vision_model.parameters()).dtype
-        pixel_values = pixel_values.to(dtype=vision_dtype)
-        vision_outputs = self.model.base_model.model.model.vision_model(pixel_values=pixel_values)
-        vision_hidden = vision_outputs.last_hidden_state.mean(dim=1)
-        vision_hidden = vision_hidden.reshape(batch_size, num_images, -1).mean(dim=1)
-        vision_hidden = vision_hidden.to(dtype=self.vision_projector.weight.dtype)
-        return self.vision_projector(vision_hidden)
+    def pool_by_mask(self, hidden_states, mask):
+        mask = mask.to(hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
+        return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
 
     def forward(self, metric_labels=None, domain_token_ids=None, **inputs):
-        vision_dtype = next(self.model.base_model.model.model.vision_model.parameters()).dtype
-        if "pixel_values" in inputs:
-            inputs["pixel_values"] = inputs["pixel_values"].to(dtype=vision_dtype)
-
-        pixel_values = inputs["pixel_values"]
         attention_mask = inputs.get("attention_mask")
-
-        with torch.no_grad():
-            vision_latent = self.encode_vision_target(pixel_values)
 
         outputs = self.model(
             **inputs,
@@ -483,10 +431,19 @@ class DecoderLatentAlignmentModel(nn.Module):
             return_dict=True,
             use_cache=False,
         )
-        decoder_hidden = mean_pool_hidden(outputs.hidden_states[-1], attention_mask)
+        hidden_states = outputs.hidden_states[-1]
+        image_mask = inputs["input_ids"].eq(self.image_token_id)
+        decoder_mask = attention_mask.bool() & ~image_mask if attention_mask is not None else ~image_mask
+
+        with torch.no_grad():
+            vision_hidden = self.pool_by_mask(hidden_states.detach(), image_mask)
+            vision_hidden = vision_hidden.to(dtype=self.vision_projector.weight.dtype)
+            vision_latent = self.vision_projector(vision_hidden)
+
+        decoder_hidden = self.pool_by_mask(hidden_states, decoder_mask)
         decoder_hidden = decoder_hidden.to(dtype=self.decoder_projector.weight.dtype)
         decoder_latent = self.decoder_projector(decoder_hidden)
-        token_hidden = outputs.hidden_states[-1].to(dtype=self.decoder_projector.weight.dtype)
+        token_hidden = hidden_states.to(dtype=self.decoder_projector.weight.dtype)
         token_latents = self.decoder_projector(token_hidden)
 
         #normalise latents
@@ -519,8 +476,8 @@ class DecoderLatentAlignmentModel(nn.Module):
             + metric_cross_entropy
             + 0.1 * coverage
             + cosine
-            + 0.25 * token_alignment
-            + 0.5 * output_steering
+            + 0.1 * token_alignment
+            + 0.05 * output_steering
         )
 
         return {
@@ -541,12 +498,32 @@ class LatentAlignmentTrainer(Trainer):
         loss = outputs["loss"]
         return (loss, outputs) if return_outputs else loss
 
-def train_decoder_with_label():
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    model = VisionAdapterClassifier(MODEL_NAME)
+    def save_model(self, output_dir=None, _internal_call=False):
+        output_dir = output_dir or self.args.output_dir
+        self.model.save_pretrained(output_dir)
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
 
-    train_dataset = SeismicImageDataset("train")
-    test_dataset = SeismicImageDataset("test")
+def train_decoder_with_label():
+    model, processor = load_unsloth_vision_model(MODEL_NAME)
+    model = FastVisionModel.get_peft_model(
+        model,
+        finetune_vision_layers=True,
+        finetune_language_layers=False,
+        finetune_attention_modules=True,
+        finetune_mlp_modules=True,
+        r=16,
+        lora_alpha=16,
+        lora_dropout=0.0,
+        bias="none",
+        random_state=3407,
+        use_rslora=False,
+        loftq_config=None,
+        target_modules="all-linear",
+    )
+
+    train_dataset = SeismicConversationDataset("train")
+    test_dataset = SeismicConversationDataset("test")
 
     args = TrainingArguments(
         output_dir=OUTPUT_DIR.as_posix(),
@@ -555,7 +532,7 @@ def train_decoder_with_label():
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=4,
-        num_train_epochs=20,
+        num_train_epochs=1,
         weight_decay=0.02,
         warmup_steps=50,
         gradient_checkpointing=True,
@@ -566,6 +543,8 @@ def train_decoder_with_label():
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         remove_unused_columns=False,
+        bf16=is_bfloat16_supported(),
+        fp16=not is_bfloat16_supported(),
     )
 
     trainer = Trainer(
@@ -573,7 +552,7 @@ def train_decoder_with_label():
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         args=args,
-        data_collator=VisionClassifierCollator(processor),
+        data_collator=UnslothVisionDataCollator(model, processor),
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=2,
@@ -586,11 +565,11 @@ def train_decoder_with_label():
     trainer.save_model((OUTPUT_DIR / "final").as_posix())
 
 def train_decoder_without_label():
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
     model = DecoderLatentAlignmentModel(
         model_name=MODEL_NAME,
         vision_adapter_path=OUTPUT_DIR / "final",
     )
+    processor = model.processor
 
     train_dataset = SeismicImageDataset("train")
     eval_dataset = SeismicImageDataset("test")
@@ -607,7 +586,7 @@ def train_decoder_without_label():
         warmup_steps=25,
         eval_strategy="epoch",
         save_strategy="epoch",
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,
         save_total_limit=2,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -641,7 +620,7 @@ def main():
 # custom loss only for decoder layer
 def test_understanding():
     test_dataset = load_dataset("thinkonward/reflection-connection", split="test")
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
+    model, processor = load_unsloth_vision_model(MODEL_NAME)
     # test knowledge
     messages = [
         {
@@ -656,12 +635,23 @@ def test_understanding():
         messages,
         add_generation_prompt=True
     )
+    selected_data = test_dataset[10]
+    label = LABEL_MAP[selected_data["label"]]
+    print("test: ",label)
+    inputs = processor(text=prompt, images=[selected_data["image"].convert("RGB")], return_tensors="pt")
+    device = next(model.parameters()).device
+    inputs = {
+        key: value.to(device) if hasattr(value, "to") else value
+        for key, value in inputs.items()
+    }
 
-    inputs = processor(text=prompt, images=[test_dataset[0]["image"].convert("RGB")], return_tensors="pt")
-
-    model = AutoModelForImageTextToText.from_pretrained(MODEL_NAME)
-
-    generated_ids = model.generate(**inputs, max_new_tokens=500)
+    generated_ids = model.generate(
+        **inputs,
+        max_new_tokens=80,
+        do_sample=False,
+        repetition_penalty=1.25,
+        no_repeat_ngram_size=3,
+    )
     generated_texts = processor.batch_decode(
         generated_ids,
         skip_special_tokens=True,
@@ -671,6 +661,7 @@ def test_understanding():
 
 if __name__ == "__main__":
     main()
+    # test_understanding()
 # 1. test model checked (not so good)
 # 1.1 train decoder and vision-adapter (not mess with encoder because need shape and texture understanding) on label, maybe it can generate description
 # 2. train model with custom loss to ensure in-topic generation with label (train just dec)
