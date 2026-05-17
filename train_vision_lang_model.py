@@ -463,13 +463,6 @@ class DecoderLatentAlignmentModel(nn.Module):
 
         cosine = 1.0 - F.cosine_similarity(decoder_latent, vision_latent, dim=-1).mean()
         token_alignment = token_level_alignment_loss(token_latents, vision_latent, attention_mask)
-        output_steering = output_steering_loss(
-            outputs.logits,
-            inputs["input_ids"],
-            domain_token_ids,
-            eos_token_id=self.get_eos_token_id(),
-        )
-
         loss = (
             infonce
             + proxy_anchor
@@ -477,7 +470,6 @@ class DecoderLatentAlignmentModel(nn.Module):
             + 0.1 * coverage
             + cosine
             + 0.1 * token_alignment
-            + 0.05 * output_steering
         )
 
         return {
@@ -488,7 +480,6 @@ class DecoderLatentAlignmentModel(nn.Module):
             "coverage_loss": coverage.detach(),
             "cosine_loss": cosine.detach(),
             "token_alignment_loss": token_alignment.detach(),
-            "output_steering_loss": output_steering.detach(),
         }
 
 
@@ -581,7 +572,7 @@ def train_decoder_without_label():
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
         gradient_accumulation_steps=4,
-        num_train_epochs=1,
+        num_train_epochs=3,
         weight_decay=0.02,
         warmup_steps=25,
         eval_strategy="epoch",
@@ -614,7 +605,7 @@ def train_decoder_without_label():
     print_one_eval_example(model.model, processor)
 
 def main():
-    train_decoder_with_label() # train vision-adapter and decoder with output label
+    # train_decoder_with_label() # train vision-adapter and decoder with output label
     train_decoder_without_label()
 # train using unsloth
 # custom loss only for decoder layer
