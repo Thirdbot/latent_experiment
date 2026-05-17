@@ -581,8 +581,22 @@ def main():
 def test_understanding():
     test_dataset = load_dataset("thinkonward/reflection-connection", split="test")
     model, processor = load_unsloth_vision_model(MODEL_NAME)
-    if (OUTPUT_DIR / "final").exists():
-        model = PeftModel.from_pretrained(model, (OUTPUT_DIR / "final").as_posix(), is_trainable=False)
+    if (CUSTOM_OUTPUT_DIR / "final").exists():
+        model = PeftModel.from_pretrained(
+            model,
+            (CUSTOM_OUTPUT_DIR / "final").as_posix(),
+            is_trainable=False,
+        )
+        print(f"loaded custom decoder adapter from {CUSTOM_OUTPUT_DIR / 'final'}")
+    elif (OUTPUT_DIR / "final").exists():
+        model = PeftModel.from_pretrained(
+            model,
+            (OUTPUT_DIR / "final").as_posix(),
+            is_trainable=False,
+        )
+        print(f"loaded vision adapter from {OUTPUT_DIR / 'final'}")
+    else:
+        print("no trained output adapter found; using base model")
 
     messages = [
         {
@@ -593,34 +607,47 @@ def test_understanding():
             ],
         },
     ]
-    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
-    selected_data = test_dataset[10]
-    label = LABEL_MAP[int(selected_data["label"])]
-    print("test:", label)
-    inputs = processor(
-        text=prompt,
-        images=[selected_data["image"].convert("RGB")],
-        return_tensors="pt",
-    )
     device = next(model.parameters()).device
-    inputs = {
-        key: value.to(device) if hasattr(value, "to") else value
-        for key, value in inputs.items()
-    }
+    model.eval()
 
-    generated_ids = model.generate(
-        **inputs,
-        max_new_tokens=80,
-        do_sample=False,
-        repetition_penalty=1.25,
-        no_repeat_ngram_size=3,
-    )
-    generated_texts = processor.batch_decode(
-        generated_ids,
-        skip_special_tokens=True,
-    )
+    for index in range(min(5, len(test_dataset))):
+        selected_data = test_dataset[index]
+        label = LABEL_MAP[int(selected_data["label"])]
+        image_path = selected_data.get("image_path") or selected_data.get("path") or f"test[{index}]"
+        prompt = processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        inputs = processor(
+            text=[prompt],
+            images=[[selected_data["image"].convert("RGB")]],
+            return_tensors="pt",
+        )
+        inputs = {
+            key: value.to(device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
 
-    print(generated_texts[0])
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=45,
+                do_sample=False,
+                repetition_penalty=1.25,
+                no_repeat_ngram_size=3,
+            )
+        prompt_len = inputs["input_ids"].shape[-1]
+        generated_text = processor.batch_decode(
+            generated_ids[:, prompt_len:],
+            skip_special_tokens=True,
+        )[0].strip()
+
+        print("test understanding")
+        print(f"source: {image_path}")
+        print(f"label: {label}")
+        print(f"generated: {generated_text}")
+        print()
 
 
 if __name__ == "__main__":
