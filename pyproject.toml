@@ -6,6 +6,7 @@ dependencies = [
     "accelerate>=1.13.0",
     "bitsandbytes>=0.46.1",
     "datasets>4.1.0,<4.4.0",
+    "huggingface-hub>=1.14.0",
     "peft>=0.18.0",
     "pillow>=12.2.0",
     "protobuf>=7.34.1",
