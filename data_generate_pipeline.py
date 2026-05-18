@@ -230,14 +230,29 @@ def run_faultnet(model, image_path, conf=0.25):
             continue
         xyxy = boxes.xyxy.detach().cpu().tolist()
         confs = boxes.conf.detach().cpu().tolist()
-        for box, score in zip(xyxy, confs):
-            detections.append(
-                {
-                    "label": "fault",
-                    "confidence": round(float(score), 4),
-                    "box_xyxy": [round(float(value), 2) for value in box],
-                }
-            )
+        classes = boxes.cls.detach().cpu().tolist() if getattr(boxes, "cls", None) is not None else [None] * len(xyxy)
+        names = getattr(result, "names", {}) or {}
+        masks = getattr(result, "masks", None)
+        mask_data = masks.data.detach().cpu() if masks is not None and getattr(masks, "data", None) is not None else None
+        polygons = masks.xy if masks is not None and getattr(masks, "xy", None) is not None else []
+        for index, (box, score, class_id) in enumerate(zip(xyxy, confs, classes)):
+            label = names.get(int(class_id), "fault") if class_id is not None else "fault"
+            detection = {
+                "label": str(label),
+                "confidence": round(float(score), 4),
+                "box_xyxy": [round(float(value), 2) for value in box],
+            }
+            if mask_data is not None and index < len(mask_data):
+                mask = mask_data[index].float()
+                detection["mask_coverage"] = round(float(mask.mean().item()), 6)
+            if index < len(polygons) and len(polygons[index]) > 0:
+                polygon = polygons[index]
+                step = max(len(polygon) // 16, 1)
+                detection["polygon_xy_sample"] = [
+                    [round(float(x), 2), round(float(y), 2)]
+                    for x, y in polygon[::step][:16]
+                ]
+            detections.append(detection)
     return detections
 
 
