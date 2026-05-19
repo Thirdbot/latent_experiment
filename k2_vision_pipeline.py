@@ -333,12 +333,33 @@ def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt):
 
     with torch.no_grad():
         generated_ids = k2_model.generate(**generation_kwargs)
-    text = k2_tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
+    token_ids = generated_ids[0].detach().cpu().tolist()
+    decode_candidates = [
+        k2_tokenizer.decode(token_ids, skip_special_tokens=True).strip(),
+        k2_tokenizer.decode(token_ids, skip_special_tokens=False).strip(),
+    ]
+    if token_ids and token_ids[0] == getattr(k2_tokenizer, "unk_token_id", None):
+        decode_candidates.extend(
+            [
+                k2_tokenizer.decode(token_ids[1:], skip_special_tokens=True).strip(),
+                k2_tokenizer.decode(token_ids[1:], skip_special_tokens=False).strip(),
+            ]
+        )
+
+    text = ""
+    for candidate in decode_candidates:
+        candidate = candidate.strip()
+        if not candidate or candidate == getattr(k2_tokenizer, "unk_token", "<unk>"):
+            continue
+        text = candidate
+        break
+    if "Answer:" in text:
+        text = text.rsplit("Answer:", 1)[-1].strip()
     if text:
         return text
 
-    raw_text = k2_tokenizer.decode(generated_ids[0], skip_special_tokens=False).strip()
-    token_preview = generated_ids[0].detach().cpu().tolist()[:64]
+    raw_text = decode_candidates[-1] if decode_candidates else ""
+    token_preview = token_ids[:64]
     return f"[empty decoded output] raw={raw_text!r} token_ids={token_preview}"
 
 
