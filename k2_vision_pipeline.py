@@ -719,6 +719,7 @@ def train_attached_vision(
     epochs=1,
     logging_steps=10,
     k2_max_length=2048,
+    do_eval=False,
 ):
     output_dir = Path(output_dir)
     final_dir = final_dir_for(output_dir)
@@ -760,7 +761,7 @@ def train_attached_vision(
     )
 
     train_dataset = K2VisionDataset(train_jsonl)
-    eval_dataset = K2VisionDataset(eval_jsonl)
+    eval_dataset = K2VisionDataset(eval_jsonl) if do_eval else None
     args = TrainingArguments(
         output_dir=Path(output_dir).as_posix(),
         logging_dir="logs",
@@ -774,7 +775,7 @@ def train_attached_vision(
         gradient_checkpointing=True,
         logging_strategy="steps",
         logging_steps=logging_steps,
-        eval_strategy="epoch",
+        eval_strategy="epoch" if do_eval else "no",
         save_strategy="epoch",
         save_total_limit=2,
         load_best_model_at_end=False,
@@ -791,7 +792,8 @@ def train_attached_vision(
         data_collator=K2VisionCollator(qwen_processor, k2_tokenizer, max_length=k2_max_length),
     )
     trainer.train(resume_from_checkpoint=latest_checkpoint(output_dir))
-    trainer.evaluate()
+    if do_eval:
+        trainer.evaluate()
     save_training_history(trainer.state.log_history, output_dir)
     trainer.save_model(final_dir.as_posix())
     qwen_processor.save_pretrained(final_dir / "qwen_vision_adapter")
@@ -886,6 +888,11 @@ def main():
         default=2048,
         help="Maximum K2 text tokens. Answer tokens are preserved; prompt tokens are truncated first.",
     )
+    train_parser.add_argument(
+        "--do-eval",
+        action="store_true",
+        help="Run evaluation each epoch. Disabled by default to avoid OOM on 24GB GPUs.",
+    )
 
     args = parser.parse_args()
     if args.command == "run":
@@ -908,6 +915,7 @@ def main():
             args.epochs,
             args.logging_steps,
             args.k2_max_length,
+            args.do_eval,
         )
 
 
