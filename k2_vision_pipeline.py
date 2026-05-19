@@ -590,6 +590,12 @@ class K2VisionTrainer(Trainer):
         loss = outputs.loss
         return (loss, outputs) if return_outputs else loss
 
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        with torch.no_grad():
+            outputs = model(**inputs)
+            loss = outputs.loss.detach()
+        return loss, None, None
+
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
         self.model.save_pretrained(output_dir)
