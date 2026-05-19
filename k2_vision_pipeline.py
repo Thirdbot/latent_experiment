@@ -391,7 +391,7 @@ class K2VisionDataset(Dataset):
 
 
 class K2VisionCollator:
-    def __init__(self, qwen_processor, k2_tokenizer, max_length=1024):
+    def __init__(self, qwen_processor, k2_tokenizer, max_length=2048):
         self.qwen_processor = qwen_processor
         self.k2_tokenizer = k2_tokenizer
         self.max_length = max_length
@@ -432,28 +432,53 @@ class K2VisionCollator:
             )
             for example in examples
         ]
-        full_texts = [
-            f"{prompt_text}\n{example['answer']}"
-            for prompt_text, example in zip(prompt_texts, examples)
-        ]
-        prompt_tokens = self.k2_tokenizer(
-            prompt_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-        )
-        full_tokens = self.k2_tokenizer(
-            full_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-        )
-        labels = full_tokens["input_ids"].clone()
-        labels[full_tokens["attention_mask"].eq(0)] = -100
-        for row, prompt_len in enumerate(prompt_tokens["attention_mask"].sum(dim=1).tolist()):
-            labels[row, :prompt_len] = -100
+        input_id_rows = []
+        label_rows = []
+        attention_rows = []
+        pad_token_id = self.k2_tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.k2_tokenizer.eos_token_id
+
+        for prompt_text, example in zip(prompt_texts, examples):
+            prompt_ids = self.k2_tokenizer(
+                prompt_text,
+                add_special_tokens=True,
+                truncation=False,
+            )["input_ids"]
+            answer_ids = self.k2_tokenizer(
+                f"\n{example['answer']}",
+                add_special_tokens=False,
+                truncation=False,
+            )["input_ids"]
+            if not answer_ids:
+                raise ValueError("Empty answer text produced no K2 target tokens.")
+
+            if len(answer_ids) >= self.max_length:
+                answer_ids = answer_ids[: self.max_length - 1]
+            max_prompt_len = self.max_length - len(answer_ids)
+            if max_prompt_len <= 0:
+                raise ValueError(
+                    "No room left for prompt tokens. Increase K2VisionCollator max_length "
+                    "or shorten generated answers."
+                )
+            prompt_ids = prompt_ids[-max_prompt_len:]
+            input_ids = prompt_ids + answer_ids
+            labels = [-100] * len(prompt_ids) + answer_ids
+
+            input_id_rows.append(input_ids)
+            label_rows.append(labels)
+            attention_rows.append([1] * len(input_ids))
+
+        batch_length = max(len(row) for row in input_id_rows)
+        for input_ids, labels, attention_mask in zip(input_id_rows, label_rows, attention_rows):
+            pad_len = batch_length - len(input_ids)
+            input_ids.extend([pad_token_id] * pad_len)
+            labels.extend([-100] * pad_len)
+            attention_mask.extend([0] * pad_len)
+
+        k2_input_ids = torch.tensor(input_id_rows, dtype=torch.long)
+        labels = torch.tensor(label_rows, dtype=torch.long)
+        k2_attention_mask = torch.tensor(attention_rows, dtype=torch.long)
         if labels.ne(-100).sum().item() == 0:
             raise ValueError(
                 "No answer tokens left for loss after masking. "
@@ -461,8 +486,8 @@ class K2VisionCollator:
             )
 
         batch = {f"qwen_{key}": value for key, value in qwen_inputs.items()}
-        batch["k2_input_ids"] = full_tokens["input_ids"]
-        batch["k2_attention_mask"] = full_tokens["attention_mask"]
+        batch["k2_input_ids"] = k2_input_ids
+        batch["k2_attention_mask"] = k2_attention_mask
         batch["labels"] = labels
         return batch
 
@@ -687,6 +712,7 @@ def train_attached_vision(
     eval_jsonl=DEFAULT_EVAL_JSONL,
     epochs=1,
     logging_steps=10,
+    k2_max_length=2048,
 ):
     output_dir = Path(output_dir)
     final_dir = final_dir_for(output_dir)
@@ -756,7 +782,7 @@ def train_attached_vision(
         args=args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=K2VisionCollator(qwen_processor, k2_tokenizer),
+        data_collator=K2VisionCollator(qwen_processor, k2_tokenizer, max_length=k2_max_length),
     )
     trainer.train(resume_from_checkpoint=latest_checkpoint(output_dir))
     trainer.evaluate()
@@ -848,6 +874,12 @@ def main():
         default=10,
         help="How often to log training loss.",
     )
+    train_parser.add_argument(
+        "--k2-max-length",
+        type=int,
+        default=2048,
+        help="Maximum K2 text tokens. Answer tokens are preserved; prompt tokens are truncated first.",
+    )
 
     args = parser.parse_args()
     if args.command == "run":
@@ -869,6 +901,7 @@ def main():
             Path(args.eval_jsonl),
             args.epochs,
             args.logging_steps,
+            args.k2_max_length,
         )
 
 
