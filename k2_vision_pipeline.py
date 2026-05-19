@@ -153,7 +153,8 @@ def load_qwen_vision_encoder(trainable=False, adapter_dir=None):
     if trainable:
         for name, param in model.named_parameters():
             is_language_param = "language" in name or "lm_head" in name or "embed_tokens" in name
-            param.requires_grad = not is_language_param
+            can_train = param.is_floating_point() or param.is_complex()
+            param.requires_grad = can_train and not is_language_param
         trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
         total_params = sum(param.numel() for param in model.parameters())
         print(f"Qwen trainable params: {trainable_params:,} / {total_params:,}")
