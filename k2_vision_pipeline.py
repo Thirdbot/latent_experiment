@@ -10,12 +10,13 @@ from PIL import Image
 from torch import nn
 from unsloth import FastVisionModel, is_bfloat16_supported
 from torch.utils.data import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
 
 K2_REPO_ID = "daven3/k2"
 K2_MODEL_DIR = Path("models/k2")
+K2_TOKENIZER_NAME = "hf-internal-testing/llama-tokenizer"
 VISION_MODEL_NAME = "unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit"
 VISION_ADAPTER_DIR = Path("outputs/vision_llm_trained/final")
 VISION_PREFIX_PROJECTOR = Path("outputs/k2_qwen_vision_projector.pt")
@@ -48,7 +49,22 @@ def latest_checkpoint(output_dir):
     output_dir = Path(output_dir)
     if not output_dir.exists():
         return None
-    return get_last_checkpoint(output_dir.as_posix())
+    checkpoint = get_last_checkpoint(output_dir.as_posix())
+    if checkpoint is None:
+        return None
+
+    checkpoint = Path(checkpoint)
+    loadable_files = (
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+        "model.safetensors",
+        "model.safetensors.index.json",
+    )
+    if any((checkpoint / filename).exists() for filename in loadable_files):
+        return checkpoint.as_posix()
+
+    print(f"ignoring non-standard checkpoint without HF model index: {checkpoint}")
+    return None
 
 
 def final_dir_for(output_dir):
@@ -104,15 +120,51 @@ def download_k2(model_dir=K2_MODEL_DIR):
     return model_dir
 
 
-def load_k2(model_dir=K2_MODEL_DIR):
-    model_dir = download_k2(model_dir)
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_dir.as_posix(),
-        use_fast=False,
-        trust_remote_code=True,
+def has_tokenizer_files(path):
+    path = Path(path)
+    return any(
+        (path / filename).exists()
+        for filename in (
+            "tokenizer.model",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        )
     )
+
+
+def load_k2_tokenizer(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME):
+    tokenizer = None
+    if has_tokenizer_files(model_dir):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                Path(model_dir).as_posix(),
+                use_fast=False,
+                trust_remote_code=True,
+            )
+        except Exception:
+            tokenizer = None
+
+    if tokenizer is None or getattr(tokenizer, "vocab_size", 0) < 1000:
+        tokenizer = LlamaTokenizer.from_pretrained(
+            tokenizer_name,
+            use_fast=False,
+        )
+
+    if getattr(tokenizer, "vocab_size", 0) < 1000:
+        raise ValueError(
+            f"Invalid K2 tokenizer vocab_size={getattr(tokenizer, 'vocab_size', None)}. "
+            "K2 needs a LLaMA tokenizer, not the incomplete local tokenizer files."
+        )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def load_k2(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME):
+    model_dir = download_k2(model_dir)
+    tokenizer = load_k2_tokenizer(model_dir, tokenizer_name)
+    print(f"loaded K2 tokenizer vocab_size={tokenizer.vocab_size}")
 
     model = AutoModelForCausalLM.from_pretrained(
         model_dir.as_posix(),
