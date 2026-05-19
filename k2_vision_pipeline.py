@@ -334,22 +334,44 @@ def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt):
     with torch.no_grad():
         generated_ids = k2_model.generate(**generation_kwargs)
     token_ids = generated_ids[0].detach().cpu().tolist()
-    decode_candidates = [
-        k2_tokenizer.decode(token_ids, skip_special_tokens=True).strip(),
-        k2_tokenizer.decode(token_ids, skip_special_tokens=False).strip(),
-    ]
-    if token_ids and token_ids[0] == getattr(k2_tokenizer, "unk_token_id", None):
-        decode_candidates.extend(
-            [
-                k2_tokenizer.decode(token_ids[1:], skip_special_tokens=True).strip(),
-                k2_tokenizer.decode(token_ids[1:], skip_special_tokens=False).strip(),
-            ]
+    token_variants = [token_ids]
+    if len(token_ids) > 1:
+        token_variants.append(token_ids[1:])
+    special_ids = {
+        token_id
+        for token_id in (
+            getattr(k2_tokenizer, "bos_token_id", None),
+            getattr(k2_tokenizer, "eos_token_id", None),
+            getattr(k2_tokenizer, "pad_token_id", None),
+            getattr(k2_tokenizer, "unk_token_id", None),
         )
+        if token_id is not None
+    }
+    filtered_ids = [token_id for token_id in token_ids if token_id not in special_ids]
+    if filtered_ids and filtered_ids != token_ids:
+        token_variants.append(filtered_ids)
+
+    decode_candidates = [
+        k2_tokenizer.decode(ids, skip_special_tokens=skip_special).strip()
+        for ids in token_variants
+        for skip_special in (True, False)
+    ]
+    sp_model = getattr(k2_tokenizer, "sp_model", None)
+    if sp_model is not None:
+        for ids in token_variants:
+            try:
+                decode_candidates.append(sp_model.DecodeIds([int(token_id) for token_id in ids]).strip())
+            except Exception:
+                pass
 
     text = ""
     for candidate in decode_candidates:
         candidate = candidate.strip()
         if not candidate or candidate == getattr(k2_tokenizer, "unk_token", "<unk>"):
+            continue
+        if candidate.startswith(getattr(k2_tokenizer, "unk_token", "<unk>")):
+            candidate = candidate[len(getattr(k2_tokenizer, "unk_token", "<unk>")) :].strip()
+        if not candidate:
             continue
         text = candidate
         break
