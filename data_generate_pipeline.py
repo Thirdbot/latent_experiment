@@ -7,24 +7,14 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 import numpy as np
-import torch
 from PIL import Image
-
-from k2_vision_pipeline import (
-    K2_MODEL_DIR,
-    K2_TRAINED_PROJECTOR,
-    encode_image_with_qwen,
-    generate_with_visual_prefix,
-    get_hidden_size,
-    load_k2,
-    load_or_create_projector,
-    load_qwen_vision_encoder,
-)
 
 
 DEFAULT_VLLM_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
 DEFAULT_VLLM_BASE_URL = "http://localhost:8000/v1"
 DEFAULT_OUTPUT_DIR = Path("outputs/generated_unicamp_instructions")
+K2_MODEL_DIR = Path("models/k2")
+K2_TRAINED_PROJECTOR = Path("outputs/k2_attached_vision/final/k2_qwen_vision_projector.pt")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".npy"}
 
 QUESTION_PROMPT = (
@@ -58,7 +48,7 @@ K2_ANSWER_PROMPT_TEMPLATE = (
 MERGE_PROMPT_TEMPLATE = (
     "You are creating the final supervised target for seismic vision-language training. "
     "Use the Qwen visual answer as the primary source for what is visible in the image. "
-    "Use the K2 geoscience answer only to improve domain terminology and fluency. "
+    "Use the K2 geoscience answer only to improve domain terminology and fluency when it is provided. "
     "FaultNet detections are weak extra evidence, not guaranteed truth. "
     "If FaultNet detections are none, this only means no auxiliary detector evidence is available; it does not rule out visible faults. "
     "Write an answer that is grounded in the image and avoids unsupported geology, well logs, survey metadata, "
@@ -277,6 +267,20 @@ def run_faultnet(model, image_path, conf=0.25):
 
 class K2VisionResponder:
     def __init__(self, k2_dir=K2_MODEL_DIR, projector_path=K2_TRAINED_PROJECTOR):
+        import torch
+
+        from k2_vision_pipeline import (
+            encode_image_with_qwen,
+            generate_with_visual_prefix,
+            get_hidden_size,
+            load_k2,
+            load_or_create_projector,
+            load_qwen_vision_encoder,
+        )
+
+        self.torch = torch
+        self.encode_image_with_qwen = encode_image_with_qwen
+        self.generate_with_visual_prefix = generate_with_visual_prefix
         self.qwen_model, self.qwen_processor = load_qwen_vision_encoder()
         self.k2_model, self.k2_tokenizer = load_k2(k2_dir)
         vision_hidden_size = get_hidden_size(self.qwen_model)
@@ -290,7 +294,7 @@ class K2VisionResponder:
         self.projector.eval()
 
     def answer(self, image, question):
-        vision_latent = encode_image_with_qwen(
+        vision_latent = self.encode_image_with_qwen(
             self.qwen_model,
             self.qwen_processor,
             image,
@@ -300,10 +304,10 @@ class K2VisionResponder:
             device=next(self.projector.parameters()).device,
             dtype=next(self.projector.parameters()).dtype,
         )
-        with torch.no_grad():
+        with self.torch.no_grad():
             visual_prefix = self.projector(vision_latent)
         prompt = K2_ANSWER_PROMPT_TEMPLATE.format(question=question)
-        return generate_with_visual_prefix(
+        return self.generate_with_visual_prefix(
             self.k2_model,
             self.k2_tokenizer,
             visual_prefix,
@@ -322,6 +326,7 @@ def build_sft_record(
     question,
     merged_reasoning,
     merged_answer,
+    answer_source,
 ):
     user_message = {
         "role": "user",
@@ -333,7 +338,7 @@ def build_sft_record(
     return {
         "image": str(image_path),
         "question": question,
-        "answer_source": "qwen_k2_merged",
+        "answer_source": answer_source,
         "reasoning": merged_reasoning or [],
         "answer": merged_answer,
         "messages": [
@@ -427,8 +432,9 @@ def generate_split(
     data_root,
     output_dir,
     vllm_client,
-    k2_responder,
+    k2_responder=None,
     faultnet=None,
+    faultnet_conf=0.05,
     max_samples=None,
 ):
     output_path = Path(output_dir) / f"{split}.jsonl"
@@ -439,7 +445,7 @@ def generate_split(
             break
 
         image = load_image(image_path)
-        detections = run_faultnet(faultnet, image_path)
+        detections = run_faultnet(faultnet, image_path, conf=faultnet_conf)
         detection_text = json.dumps(detections, ensure_ascii=False) if detections else "none"
 
         question = vllm_client.generate(
@@ -456,9 +462,16 @@ def generate_split(
             answer_prompt,
             max_new_tokens=384,
         )
-        k2_answer_raw = k2_responder.answer(image, question)
         generator_reasoning, generator_answer = split_reasoning_answer(generator_answer_raw)
-        k2_reasoning, k2_answer = split_reasoning_answer(k2_answer_raw)
+        if k2_responder is not None:
+            k2_answer_raw = k2_responder.answer(image, question)
+            k2_reasoning, k2_answer = split_reasoning_answer(k2_answer_raw)
+            answer_source = "qwen_k2_merged"
+        else:
+            k2_answer_raw = ""
+            k2_reasoning = []
+            k2_answer = "K2 answer was not generated for this sample."
+            answer_source = "qwen_faultnet_merged"
         merged_answer_raw, merged_reasoning, merged_answer = merge_answers(
             vllm_client=vllm_client,
             image=image,
@@ -474,6 +487,7 @@ def generate_split(
             question=question,
             merged_reasoning=merged_reasoning,
             merged_answer=merged_answer,
+            answer_source=answer_source,
         )
 
         record = build_instruction_record(
@@ -494,7 +508,7 @@ def generate_split(
         write_jsonl(output_path, record)
         write_jsonl(sft_output_path, sft_record)
         count += 1
-        print(f"{split}[{count}] {image_path} merged=qwen_k2")
+        print(f"{split}[{count}] {image_path} merged={answer_source}")
 
 
 def main():
@@ -536,6 +550,12 @@ def main():
         help="Optional YOLO/FaultNet weights path. Omit to skip detection context.",
     )
     parser.add_argument(
+        "--faultnet-conf",
+        type=float,
+        default=0.05,
+        help="YOLO/FaultNet confidence threshold. Lower values are useful for Unicamp domain shift.",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
@@ -551,6 +571,11 @@ def main():
         default=K2_TRAINED_PROJECTOR.as_posix(),
         help="Qwen-vision-to-K2-prefix projector path.",
     )
+    parser.add_argument(
+        "--use-k2",
+        action="store_true",
+        help="Also load local Qwen vision + K2 responder. This needs extra GPU memory and may conflict with vLLM on one GPU.",
+    )
     args = parser.parse_args()
 
     vllm_client = VLLMClient(
@@ -559,10 +584,12 @@ def main():
         api_key=args.vllm_api_key,
     )
     faultnet = load_faultnet(args.faultnet_weights)
-    k2_responder = K2VisionResponder(
-        k2_dir=Path(args.k2_dir),
-        projector_path=Path(args.projector),
-    )
+    k2_responder = None
+    if args.use_k2:
+        k2_responder = K2VisionResponder(
+            k2_dir=Path(args.k2_dir),
+            projector_path=Path(args.projector),
+        )
 
     for split in args.splits:
         generate_split(
@@ -572,6 +599,7 @@ def main():
             vllm_client=vllm_client,
             k2_responder=k2_responder,
             faultnet=faultnet,
+            faultnet_conf=args.faultnet_conf,
             max_samples=args.max_samples,
         )
 
