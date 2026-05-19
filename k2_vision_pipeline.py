@@ -332,6 +332,15 @@ def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt):
     return k2_tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
 
 
+def build_k2_vqa_prompt(question):
+    return (
+        "The preceding soft visual prefix comes from a Qwen-VL image encoder that processed "
+        "a 2D seismic image. Answer the user's seismic interpretation question using visible "
+        "evidence only. Use concise geoscience language.\n\n"
+        f"Question: {question}\nAnswer:"
+    )
+
+
 def get_message_text(messages):
     if not messages:
         return ""
@@ -661,6 +670,7 @@ def run_pipeline(
     projector_path=None,
     vision_adapter_dir=None,
     vision_token_drop_rate=0.0,
+    question=None,
 ):
     image = Image.open(image_path).convert("RGB")
     trained_dir = Path(trained_dir)
@@ -702,10 +712,13 @@ def run_pipeline(
     with torch.no_grad():
         visual_prefix = projector(qwen_vision_latent)
 
-    answer = generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, K2_PROMPT)
+    prompt = build_k2_vqa_prompt(question) if question else K2_PROMPT
+    answer = generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt)
 
     print("k2 attached vision pipeline")
     print(f"image: {image_path}")
+    if question:
+        print(f"question: {question}")
     print(f"k2_answer: {answer}")
 
 
@@ -837,6 +850,11 @@ def main():
         default=0.0,
         help="Image-token drop rate during inference. Default keeps all image tokens.",
     )
+    run_parser.add_argument(
+        "--question",
+        default=None,
+        help="Optional VQA question. If omitted, uses the default seismic classification prompt.",
+    )
 
     train_parser = subparsers.add_parser("train")
     train_parser.add_argument(
@@ -903,6 +921,7 @@ def main():
             Path(args.projector) if args.projector else None,
             Path(args.vision_adapter) if args.vision_adapter else None,
             args.vision_token_drop_rate,
+            args.question,
         )
     elif args.command == "train":
         train_attached_vision(
