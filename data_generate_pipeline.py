@@ -4,6 +4,7 @@ import json
 import mimetypes
 import tempfile
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -16,6 +17,7 @@ DEFAULT_OUTPUT_DIR = Path("outputs/generated_unicamp_instructions")
 K2_MODEL_DIR = Path("models/k2")
 K2_TRAINED_PROJECTOR = Path("outputs/k2_attached_vision/final/k2_qwen_vision_projector.pt")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".npy"}
+VLLM_MAX_IMAGE_SIDE = 1280
 
 QUESTION_PROMPT = (
     "You are creating visual instruction data for 2D seismic interpretation. "
@@ -104,7 +106,18 @@ def iter_split_images(data_root, split):
             yield path
 
 
+def resize_for_vllm(image, max_side=VLLM_MAX_IMAGE_SIDE):
+    width, height = image.size
+    largest = max(width, height)
+    if largest <= max_side:
+        return image
+    scale = max_side / largest
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    return image.resize(new_size, Image.Resampling.BICUBIC)
+
+
 def image_to_data_url(image, image_format="PNG"):
+    image = resize_for_vllm(image)
     with tempfile.NamedTemporaryFile(suffix=f".{image_format.lower()}") as file:
         image.save(file.name, format=image_format)
         data = Path(file.name).read_bytes()
@@ -143,8 +156,12 @@ class VLLMClient:
             },
             method="POST",
         )
-        with urlopen(request) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(request) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"vLLM HTTP {error.code}: {body}") from error
         return result["choices"][0]["message"]["content"].strip()
 
 
@@ -439,76 +456,86 @@ def generate_split(
 ):
     output_path = Path(output_dir) / f"{split}.jsonl"
     sft_output_path = Path(output_dir) / f"{split}_sft.jsonl"
+    error_output_path = Path(output_dir) / f"{split}_errors.jsonl"
     count = 0
     for image_path in iter_split_images(data_root, split):
         if max_samples is not None and count >= max_samples:
             break
 
-        image = load_image(image_path)
-        detections = run_faultnet(faultnet, image_path, conf=faultnet_conf)
-        detection_text = json.dumps(detections, ensure_ascii=False) if detections else "none"
+        try:
+            image = load_image(image_path)
+            detections = run_faultnet(faultnet, image_path, conf=faultnet_conf)
+            detection_text = json.dumps(detections, ensure_ascii=False) if detections else "none"
 
-        question = vllm_client.generate(
-            image,
-            QUESTION_PROMPT,
-            max_new_tokens=96,
-        )
-        answer_prompt = ANSWER_PROMPT_TEMPLATE.format(
-            question=question,
-            detections=detection_text,
-        )
-        generator_answer_raw = vllm_client.generate(
-            image,
-            answer_prompt,
-            max_new_tokens=384,
-        )
-        generator_reasoning, generator_answer = split_reasoning_answer(generator_answer_raw)
-        if k2_responder is not None:
-            k2_answer_raw = k2_responder.answer(image, question)
-            k2_reasoning, k2_answer = split_reasoning_answer(k2_answer_raw)
-            answer_source = "qwen_k2_merged"
-        else:
-            k2_answer_raw = ""
-            k2_reasoning = []
-            k2_answer = "K2 answer was not generated for this sample."
-            answer_source = "qwen_faultnet_merged"
-        merged_answer_raw, merged_reasoning, merged_answer = merge_answers(
-            vllm_client=vllm_client,
-            image=image,
-            question=question,
-            detections=detections,
-            qwen_reasoning=generator_reasoning,
-            qwen_answer=generator_answer,
-            k2_reasoning=k2_reasoning,
-            k2_answer=k2_answer,
-        )
-        sft_record = build_sft_record(
-            image_path=image_path,
-            question=question,
-            merged_reasoning=merged_reasoning,
-            merged_answer=merged_answer,
-            answer_source=answer_source,
-        )
+            question = vllm_client.generate(
+                image,
+                QUESTION_PROMPT,
+                max_new_tokens=96,
+            )
+            answer_prompt = ANSWER_PROMPT_TEMPLATE.format(
+                question=question,
+                detections=detection_text,
+            )
+            generator_answer_raw = vllm_client.generate(
+                image,
+                answer_prompt,
+                max_new_tokens=384,
+            )
+            generator_reasoning, generator_answer = split_reasoning_answer(generator_answer_raw)
+            if k2_responder is not None:
+                k2_answer_raw = k2_responder.answer(image, question)
+                k2_reasoning, k2_answer = split_reasoning_answer(k2_answer_raw)
+                answer_source = "qwen_k2_merged"
+            else:
+                k2_answer_raw = ""
+                k2_reasoning = []
+                k2_answer = "K2 answer was not generated for this sample."
+                answer_source = "qwen_faultnet_merged"
+            merged_answer_raw, merged_reasoning, merged_answer = merge_answers(
+                vllm_client=vllm_client,
+                image=image,
+                question=question,
+                detections=detections,
+                qwen_reasoning=generator_reasoning,
+                qwen_answer=generator_answer,
+                k2_reasoning=k2_reasoning,
+                k2_answer=k2_answer,
+            )
+            sft_record = build_sft_record(
+                image_path=image_path,
+                question=question,
+                merged_reasoning=merged_reasoning,
+                merged_answer=merged_answer,
+                answer_source=answer_source,
+            )
 
-        record = build_instruction_record(
-            image_path=image_path,
-            split=split,
-            question=question,
-            generator_answer=generator_answer,
-            k2_answer=k2_answer,
-            detections=detections,
-            generator_reasoning=generator_reasoning,
-            k2_reasoning=k2_reasoning,
-            generator_answer_raw=generator_answer_raw,
-            k2_answer_raw=k2_answer_raw,
-            merged_reasoning=merged_reasoning,
-            merged_answer=merged_answer,
-            merged_answer_raw=merged_answer_raw,
-        )
-        write_jsonl(output_path, record)
-        write_jsonl(sft_output_path, sft_record)
-        count += 1
-        print(f"{split}[{count}] {image_path} merged={answer_source}")
+            record = build_instruction_record(
+                image_path=image_path,
+                split=split,
+                question=question,
+                generator_answer=generator_answer,
+                k2_answer=k2_answer,
+                detections=detections,
+                generator_reasoning=generator_reasoning,
+                k2_reasoning=k2_reasoning,
+                generator_answer_raw=generator_answer_raw,
+                k2_answer_raw=k2_answer_raw,
+                merged_reasoning=merged_reasoning,
+                merged_answer=merged_answer,
+                merged_answer_raw=merged_answer_raw,
+            )
+            write_jsonl(output_path, record)
+            write_jsonl(sft_output_path, sft_record)
+            count += 1
+            print(f"{split}[{count}] {image_path} merged={answer_source}")
+        except Exception as error:
+            error_record = {
+                "image": str(image_path),
+                "split": split,
+                "error": str(error),
+            }
+            write_jsonl(error_output_path, error_record)
+            print(f"{split}[skip] {image_path} error={error}")
 
 
 def main():
