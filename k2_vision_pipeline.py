@@ -391,7 +391,7 @@ class K2VisionDataset(Dataset):
 
 
 class K2VisionCollator:
-    def __init__(self, qwen_processor, k2_tokenizer, max_length=256):
+    def __init__(self, qwen_processor, k2_tokenizer, max_length=1024):
         self.qwen_processor = qwen_processor
         self.k2_tokenizer = k2_tokenizer
         self.max_length = max_length
@@ -454,6 +454,11 @@ class K2VisionCollator:
         labels[full_tokens["attention_mask"].eq(0)] = -100
         for row, prompt_len in enumerate(prompt_tokens["attention_mask"].sum(dim=1).tolist()):
             labels[row, :prompt_len] = -100
+        if labels.ne(-100).sum().item() == 0:
+            raise ValueError(
+                "No answer tokens left for loss after masking. "
+                "Increase K2VisionCollator max_length or shorten the prompt/answers."
+            )
 
         batch = {f"qwen_{key}": value for key, value in qwen_inputs.items()}
         batch["k2_input_ids"] = full_tokens["input_ids"]

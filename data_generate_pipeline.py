@@ -132,7 +132,7 @@ class VLLMClient:
         self.model = model
         self.api_key = api_key
 
-    def generate(self, image, prompt, max_new_tokens=256):
+    def generate(self, image, prompt, max_new_tokens=256, temperature=0.0):
         payload = {
             "model": self.model,
             "messages": [
@@ -145,7 +145,7 @@ class VLLMClient:
                 }
             ],
             "max_tokens": max_new_tokens,
-            "temperature": 0.0,
+            "temperature": temperature,
         }
         request = Request(
             f"{self.base_url}/chat/completions",
@@ -211,6 +211,7 @@ def merge_answers(
     qwen_answer,
     k2_reasoning,
     k2_answer,
+    temperature=0.0,
 ):
     detection_text = json.dumps(detections, ensure_ascii=False) if detections else "none"
     prompt = MERGE_PROMPT_TEMPLATE.format(
@@ -221,7 +222,7 @@ def merge_answers(
         k2_reasoning=json.dumps(k2_reasoning or [], ensure_ascii=False),
         k2_answer=k2_answer,
     )
-    raw = vllm_client.generate(image, prompt, max_new_tokens=384)
+    raw = vllm_client.generate(image, prompt, max_new_tokens=384, temperature=temperature)
     reasoning, final_answer = split_reasoning_answer(raw)
     if not final_answer:
         final_answer = qwen_answer or k2_answer
@@ -453,6 +454,9 @@ def generate_split(
     faultnet=None,
     faultnet_conf=0.05,
     max_samples=None,
+    question_temperature=0.7,
+    answer_temperature=0.0,
+    merge_temperature=0.0,
 ):
     output_path = Path(output_dir) / f"{split}.jsonl"
     sft_output_path = Path(output_dir) / f"{split}_sft.jsonl"
@@ -471,6 +475,7 @@ def generate_split(
                 image,
                 QUESTION_PROMPT,
                 max_new_tokens=96,
+                temperature=question_temperature,
             )
             answer_prompt = ANSWER_PROMPT_TEMPLATE.format(
                 question=question,
@@ -480,6 +485,7 @@ def generate_split(
                 image,
                 answer_prompt,
                 max_new_tokens=384,
+                temperature=answer_temperature,
             )
             generator_reasoning, generator_answer = split_reasoning_answer(generator_answer_raw)
             if k2_responder is not None:
@@ -500,6 +506,7 @@ def generate_split(
                 qwen_answer=generator_answer,
                 k2_reasoning=k2_reasoning,
                 k2_answer=k2_answer,
+                temperature=merge_temperature,
             )
             sft_record = build_sft_record(
                 image_path=image_path,
@@ -589,6 +596,24 @@ def main():
         help="Limit samples per split for dry runs.",
     )
     parser.add_argument(
+        "--question-temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for generated questions. Higher gives more diverse questions.",
+    )
+    parser.add_argument(
+        "--answer-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for generated answers.",
+    )
+    parser.add_argument(
+        "--merge-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for merged final SFT answers.",
+    )
+    parser.add_argument(
         "--k2-dir",
         default=K2_MODEL_DIR.as_posix(),
         help="Local K2 model repo folder.",
@@ -628,6 +653,9 @@ def main():
             faultnet=faultnet,
             faultnet_conf=args.faultnet_conf,
             max_samples=args.max_samples,
+            question_temperature=args.question_temperature,
+            answer_temperature=args.answer_temperature,
+            merge_temperature=args.merge_temperature,
         )
 
 
