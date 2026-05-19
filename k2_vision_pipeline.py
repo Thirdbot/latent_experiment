@@ -318,18 +318,28 @@ def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt):
     )
     attention_mask = torch.cat([prefix_mask, text_inputs["attention_mask"]], dim=1)
 
+    generation_kwargs = {
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "max_new_tokens": 128,
+        "min_new_tokens": 8,
+        "do_sample": False,
+        "repetition_penalty": 1.15,
+        "no_repeat_ngram_size": 3,
+        "pad_token_id": k2_tokenizer.pad_token_id,
+    }
+    if k2_tokenizer.eos_token_id is not None:
+        generation_kwargs["eos_token_id"] = k2_tokenizer.eos_token_id
+
     with torch.no_grad():
-        generated_ids = k2_model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=96,
-            do_sample=False,
-            repetition_penalty=1.15,
-            no_repeat_ngram_size=3,
-            pad_token_id=k2_tokenizer.pad_token_id,
-            eos_token_id=k2_tokenizer.eos_token_id,
-        )
-    return k2_tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
+        generated_ids = k2_model.generate(**generation_kwargs)
+    text = k2_tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
+    if text:
+        return text
+
+    raw_text = k2_tokenizer.decode(generated_ids[0], skip_special_tokens=False).strip()
+    token_preview = generated_ids[0].detach().cpu().tolist()[:64]
+    return f"[empty decoded output] raw={raw_text!r} token_ids={token_preview}"
 
 
 def build_k2_vqa_prompt(question):
