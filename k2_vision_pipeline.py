@@ -5,7 +5,7 @@ from pathlib import Path
 import unsloth
 import torch
 from huggingface_hub import snapshot_download
-from peft import PeftModel
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from PIL import Image
 from torch import nn
 from unsloth import FastVisionModel, is_bfloat16_supported
@@ -27,6 +27,7 @@ DEFAULT_EVAL_JSONL = GENERATED_DATA_DIR / "validation_sft.jsonl"
 K2_FINAL_DIR = K2_VISION_OUTPUT_DIR / "final"
 K2_TRAINED_VISION_ADAPTER_DIR = K2_FINAL_DIR / "qwen_vision_adapter"
 K2_TRAINED_PROJECTOR = K2_FINAL_DIR / "k2_qwen_vision_projector.pt"
+K2_TRAINED_LORA_DIR = K2_FINAL_DIR / "k2_lora_adapter"
 NUM_VISION_PREFIX_TOKENS = 8
 VISION_TOKEN_DROP_RATE = 0.75
 
@@ -43,6 +44,22 @@ K2_PROMPT = (
     "Transparent_Planar. Answer in exactly two concise sentences. Sentence 1: <Class>. "
     "Sentence 2: one visible seismic reason using reflector continuity, amplitude, "
     "geometry, offset, chaos, or transparency. Do not use markdown or bullets."
+)
+
+K2_VQA_PROMPT_TEMPLATE = (
+    "The preceding soft visual prefix comes from a Qwen-VL image encoder that processed "
+    "a 2D seismic reflection image. Answer the user's seismic interpretation question using "
+    "only visible image evidence. Stay in seismic image interpretation; do not discuss "
+    "seismographs, earthquakes, stations, papers, conferences, or soil dynamics unless the "
+    "image visibly contains that information.\n\n"
+    "Use exactly this format:\n"
+    "Reasoning:\n"
+    "- one short visible seismic clue\n"
+    "- one short visible seismic clue\n"
+    "Final answer: one concise answer grounded in reflector continuity, amplitude, geometry, "
+    "offset, chaos, or transparency.\n\n"
+    "Question: {question}\n"
+    "Answer:"
 )
 
 def latest_checkpoint(output_dir):
@@ -77,6 +94,10 @@ def adapter_dir_for(output_dir):
 
 def projector_path_for(output_dir):
     return final_dir_for(output_dir) / "k2_qwen_vision_projector.pt"
+
+
+def k2_lora_dir_for(output_dir):
+    return final_dir_for(output_dir) / "k2_lora_adapter"
 
 
 def resolve_existing_path(*paths):
@@ -161,7 +182,7 @@ def load_k2_tokenizer(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME):
     return tokenizer
 
 
-def load_k2(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME):
+def load_k2(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME, lora_adapter_dir=None, is_trainable=False):
     model_dir = download_k2(model_dir)
     tokenizer = load_k2_tokenizer(model_dir, tokenizer_name)
     print(f"loaded K2 tokenizer vocab_size={tokenizer.vocab_size}")
@@ -172,8 +193,33 @@ def load_k2(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME):
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True,
     )
+    if lora_adapter_dir is not None and Path(lora_adapter_dir).exists():
+        model = PeftModel.from_pretrained(
+            model,
+            Path(lora_adapter_dir).as_posix(),
+            is_trainable=is_trainable,
+        )
+        print(f"loaded K2 LoRA adapter from {lora_adapter_dir}")
     model.eval()
     return model, tokenizer
+
+
+def add_k2_lora(model, r=8, alpha=16, dropout=0.05):
+    if isinstance(model, PeftModel):
+        return model
+    config = LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    )
+    model = get_peft_model(model, config)
+    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    total_params = sum(param.numel() for param in model.parameters())
+    print(f"K2 LoRA trainable params: {trainable_params:,} / {total_params:,}")
+    return model
 
 
 def load_qwen_vision_encoder(trainable=False, adapter_dir=None):
@@ -438,12 +484,7 @@ def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt):
 
 
 def build_k2_vqa_prompt(question):
-    return (
-        "The preceding soft visual prefix comes from a Qwen-VL image encoder that processed "
-        "a 2D seismic image. Answer the user's seismic interpretation question using visible "
-        "evidence only. Use concise geoscience language.\n\n"
-        f"Question: {question}\nAnswer:"
-    )
+    return K2_VQA_PROMPT_TEMPLATE.format(question=question)
 
 
 def get_message_text(messages):
@@ -539,11 +580,7 @@ class K2VisionCollator:
         )
 
         prompt_texts = [
-            (
-                "The preceding soft visual prefix comes from a Qwen-VL image encoder that "
-                "processed a 2D seismic image. Answer the user's seismic interpretation "
-                f"question using visible evidence only.\n\nQuestion: {example['question']}\nAnswer:"
-            )
+            build_k2_vqa_prompt(example["question"])
             for example in examples
         ]
         input_id_rows = []
@@ -623,8 +660,8 @@ class FrozenK2VisionModel(nn.Module):
         self.vision_token_drop_rate = vision_token_drop_rate
 
         self.k2_model.eval()
-        for param in self.k2_model.parameters():
-            param.requires_grad = False
+        for name, param in self.k2_model.named_parameters():
+            param.requires_grad = param.requires_grad and "lora_" in name
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         if hasattr(self.qwen_model, "gradient_checkpointing_enable"):
@@ -647,6 +684,8 @@ class FrozenK2VisionModel(nn.Module):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         self.qwen_model.save_pretrained(output_dir / "qwen_vision_adapter")
+        if isinstance(self.k2_model, PeftModel):
+            self.k2_model.save_pretrained(output_dir / "k2_lora_adapter")
         torch.save(self.projector.state_dict(), output_dir / "k2_qwen_vision_projector.pt")
 
     def forward(self, **batch):
@@ -792,7 +831,11 @@ def run_pipeline(
         VISION_PREFIX_PROJECTOR,
     )
     qwen_model, qwen_processor = load_qwen_vision_encoder(adapter_dir=vision_adapter_dir)
-    k2_model, k2_tokenizer = load_k2(k2_dir)
+    k2_lora_dir = trained_dir / "k2_lora_adapter"
+    k2_model, k2_tokenizer = load_k2(
+        k2_dir,
+        lora_adapter_dir=k2_lora_dir if k2_lora_dir.exists() else None,
+    )
 
     vision_hidden_size = get_hidden_size(qwen_model)
     k2_hidden_size = get_hidden_size(k2_model)
@@ -838,6 +881,8 @@ def train_attached_vision(
     logging_steps=10,
     k2_max_length=2048,
     do_eval=False,
+    train_k2_lora=True,
+    k2_lora_r=8,
 ):
     output_dir = Path(output_dir)
     final_dir = final_dir_for(output_dir)
@@ -856,7 +901,17 @@ def train_attached_vision(
         trainable=True,
         adapter_dir=vision_adapter_dir,
     )
-    k2_model, k2_tokenizer = load_k2(k2_dir)
+    k2_lora_dir = resolve_existing_path(
+        k2_lora_dir_for(output_dir),
+        K2_TRAINED_LORA_DIR,
+    )
+    k2_model, k2_tokenizer = load_k2(
+        k2_dir,
+        lora_adapter_dir=k2_lora_dir if train_k2_lora and k2_lora_dir.exists() else None,
+        is_trainable=train_k2_lora,
+    )
+    if train_k2_lora:
+        k2_model = add_k2_lora(k2_model, r=k2_lora_r)
     if hasattr(k2_model.config, "use_cache"):
         k2_model.config.use_cache = False
 
@@ -917,10 +972,14 @@ def train_attached_vision(
     qwen_processor.save_pretrained(final_dir / "qwen_vision_adapter")
     k2_tokenizer.save_pretrained(final_dir / "k2_tokenizer")
     torch.save(projector.state_dict(), final_dir / "k2_qwen_vision_projector.pt")
+    if isinstance(k2_model, PeftModel):
+        k2_model.save_pretrained(final_dir / "k2_lora_adapter")
     Path(projector_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(projector.state_dict(), projector_path)
     print(f"saved trained K2 vision adapter to {final_dir / 'qwen_vision_adapter'}")
     print(f"saved trained projector to {final_dir / 'k2_qwen_vision_projector.pt'}")
+    if isinstance(k2_model, PeftModel):
+        print(f"saved trained K2 LoRA adapter to {final_dir / 'k2_lora_adapter'}")
 
 
 def main():
@@ -1016,6 +1075,17 @@ def main():
         action="store_true",
         help="Run evaluation each epoch. Disabled by default to avoid OOM on 24GB GPUs.",
     )
+    train_parser.add_argument(
+        "--no-k2-lora",
+        action="store_true",
+        help="Disable small K2 decoder LoRA training.",
+    )
+    train_parser.add_argument(
+        "--k2-lora-r",
+        type=int,
+        default=8,
+        help="Rank for the small K2 decoder LoRA.",
+    )
 
     args = parser.parse_args()
     if args.command == "run":
@@ -1040,6 +1110,8 @@ def main():
             args.logging_steps,
             args.k2_max_length,
             args.do_eval,
+            not args.no_k2_lora,
+            args.k2_lora_r,
         )
 
 
