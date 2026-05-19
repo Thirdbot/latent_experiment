@@ -7,6 +7,8 @@ dependencies = [
     "bitsandbytes>=0.46.1",
     "datasets>4.1.0,<4.4.0",
     "huggingface-hub>=1.14.0",
+    "matplotlib>=3.10.0",
+    "opencv-python>=4.12.0.88",
     "peft>=0.18.0",
     "pillow>=12.2.0",
     "protobuf>=7.34.1",
@@ -18,5 +20,6 @@ dependencies = [
     "torchvision>=0.25.0,<0.26.0",
     "transformers>5.1.0,<=5.5.0",
     "trl>0.19.0,<=0.24.0",
+    "ultralytics>=8.3.0",
     "unsloth>=2026.5.0",
 ]

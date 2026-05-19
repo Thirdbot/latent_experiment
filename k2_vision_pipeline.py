@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
+import unsloth
 import torch
 from huggingface_hub import snapshot_download
 from peft import PeftModel
@@ -563,6 +564,59 @@ class K2VisionTrainer(Trainer):
         self.model.save_pretrained(output_dir)
 
 
+def save_training_history(log_history, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    history_path = output_dir / "training_history.json"
+    with history_path.open("w", encoding="utf-8") as file:
+        json.dump(log_history, file, indent=2)
+
+    train_steps = []
+    train_losses = []
+    eval_steps = []
+    eval_losses = []
+    for item in log_history:
+        step = item.get("step")
+        if step is None:
+            continue
+        if "loss" in item:
+            train_steps.append(step)
+            train_losses.append(float(item["loss"]))
+        if "eval_loss" in item:
+            eval_steps.append(step)
+            eval_losses.append(float(item["eval_loss"]))
+
+    if not train_losses and not eval_losses:
+        print(f"saved training history to {history_path}; no loss points found for plot")
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(f"saved training history to {history_path}; install matplotlib to save loss PNG")
+        return
+
+    plt.figure(figsize=(9, 5))
+    if train_losses:
+        plt.plot(train_steps, train_losses, marker="o", linewidth=1.5, label="train loss")
+    if eval_losses:
+        plt.plot(eval_steps, eval_losses, marker="o", linewidth=1.5, label="eval loss")
+    plt.xlabel("training step")
+    plt.ylabel("loss")
+    plt.title("K2 Vision Training Loss")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plot_path = output_dir / "training_loss.png"
+    plt.savefig(plot_path, dpi=160)
+    plt.close()
+    print(f"saved training history to {history_path}")
+    print(f"saved loss plot to {plot_path}")
+
+
 def run_pipeline(
     image_path,
     k2_dir=K2_MODEL_DIR,
@@ -625,6 +679,8 @@ def train_attached_vision(
     vision_token_drop_rate=VISION_TOKEN_DROP_RATE,
     train_jsonl=DEFAULT_TRAIN_JSONL,
     eval_jsonl=DEFAULT_EVAL_JSONL,
+    epochs=1,
+    logging_steps=10,
 ):
     output_dir = Path(output_dir)
     final_dir = final_dir_for(output_dir)
@@ -674,10 +730,12 @@ def train_attached_vision(
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=4,
-        num_train_epochs=1,
+        num_train_epochs=epochs,
         weight_decay=0.02,
         warmup_steps=25,
         gradient_checkpointing=True,
+        logging_strategy="steps",
+        logging_steps=logging_steps,
         eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=2,
@@ -696,6 +754,7 @@ def train_attached_vision(
     )
     trainer.train(resume_from_checkpoint=latest_checkpoint(output_dir))
     trainer.evaluate()
+    save_training_history(trainer.state.log_history, output_dir)
     trainer.save_model(final_dir.as_posix())
     qwen_processor.save_pretrained(final_dir / "qwen_vision_adapter")
     k2_tokenizer.save_pretrained(final_dir / "k2_tokenizer")
@@ -771,6 +830,18 @@ def main():
         default=DEFAULT_EVAL_JSONL.as_posix(),
         help="Generated SFT JSONL for eval, usually outputs/generated_unicamp_instructions/validation_sft.jsonl.",
     )
+    train_parser.add_argument(
+        "--epochs",
+        type=float,
+        default=1,
+        help="Number of training epochs.",
+    )
+    train_parser.add_argument(
+        "--logging-steps",
+        type=int,
+        default=10,
+        help="How often to log training loss.",
+    )
 
     args = parser.parse_args()
     if args.command == "run":
@@ -790,6 +861,8 @@ def main():
             args.vision_token_drop_rate,
             Path(args.train_jsonl),
             Path(args.eval_jsonl),
+            args.epochs,
+            args.logging_steps,
         )
 
 

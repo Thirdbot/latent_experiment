@@ -38,9 +38,10 @@ QUESTION_PROMPT = (
 ANSWER_PROMPT_TEMPLATE = (
     "You are a seismic interpretation assistant using thinking mode. "
     "Answer the question using only visible evidence from the seismic image. "
-    "If fault detections are provided, use them as weak evidence, not as guaranteed truth.\n\n"
+    "If auxiliary FaultNet detections are provided, use them as weak evidence, not as guaranteed truth. "
+    "If no auxiliary detections are provided, do not assume faults are absent; judge the image directly.\n\n"
     "Question: {question}\n"
-    "Fault detections: {detections}\n\n"
+    "Auxiliary FaultNet detections: {detections}\n\n"
     "Return strict JSON only with keys: reasoning, final_answer. "
     "reasoning must be a list of 2-5 short evidence-grounded steps. "
     "final_answer must be a concise answer to the question. "
@@ -59,10 +60,11 @@ MERGE_PROMPT_TEMPLATE = (
     "Use the Qwen visual answer as the primary source for what is visible in the image. "
     "Use the K2 geoscience answer only to improve domain terminology and fluency. "
     "FaultNet detections are weak extra evidence, not guaranteed truth. "
+    "If FaultNet detections are none, this only means no auxiliary detector evidence is available; it does not rule out visible faults. "
     "Write an answer that is grounded in the image and avoids unsupported geology, well logs, survey metadata, "
     "exact locations, or claims not visible in the seismic section.\n\n"
     "Question: {question}\n"
-    "FaultNet detections: {detections}\n"
+    "Auxiliary FaultNet detections: {detections}\n"
     "Qwen visual reasoning: {qwen_reasoning}\n"
     "Qwen visual answer: {qwen_answer}\n"
     "K2 geoscience reasoning: {k2_reasoning}\n"
@@ -84,7 +86,23 @@ def load_image(path):
         array = np.clip((array - low) / max(high - low, 1e-6), 0, 1)
         array = (array * 255).astype(np.uint8)
         return Image.fromarray(array).convert("RGB")
-    return Image.open(path).convert("RGB")
+    array = np.asarray(Image.open(path))
+    array = np.squeeze(array)
+    if array.ndim == 3 and array.shape[-1] in (3, 4) and array.dtype == np.uint8:
+        return Image.fromarray(array[..., :3]).convert("RGB")
+    if array.ndim == 3:
+        array = array[..., 0]
+    array = array.astype(np.float32)
+    finite = np.isfinite(array)
+    if not finite.any():
+        raise ValueError(f"Image has no finite pixel values: {path}")
+    array = np.where(finite, array, np.nanmedian(array[finite]))
+    low, high = np.percentile(array[finite], [1, 99])
+    if abs(float(high - low)) < 1e-6:
+        low, high = float(array[finite].min()), float(array[finite].max())
+    array = np.clip((array - low) / max(high - low, 1e-6), 0, 1)
+    array = (array * 255).astype(np.uint8)
+    return Image.fromarray(array).convert("RGB")
 
 
 def iter_split_images(data_root, split):
@@ -222,7 +240,8 @@ def load_faultnet(weights_path):
 def run_faultnet(model, image_path, conf=0.25):
     if model is None:
         return []
-    results = model.predict(source=Path(image_path).as_posix(), conf=conf, verbose=False)
+    image = np.asarray(load_image(image_path))
+    results = model.predict(source=image, conf=conf, verbose=False)
     detections = []
     for result in results:
         boxes = getattr(result, "boxes", None)

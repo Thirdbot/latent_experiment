@@ -1,4 +1,4 @@
-outputs/
+outputs
 unsloth_compiled_cache
 .idea/
 __pycache__/
