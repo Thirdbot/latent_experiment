@@ -31,13 +31,12 @@ def get_files(metadata):
         checksum = file_info.get("checksum", "")
         md5 = checksum.replace("md5:", "") if checksum.startswith("md5:") else checksum
         links = file_info.get("links", {})
-        download_url = links.get("self") or links.get("download")
         files.append(
             {
                 "name": key,
                 "size": int(file_info.get("size", 0)),
                 "md5": md5,
-                "url": download_url,
+                "url": links.get("self") or links.get("download"),
             }
         )
     return sorted(files, key=lambda item: item["name"])

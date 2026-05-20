@@ -1,12 +1,13 @@
 import argparse
 from pathlib import Path
 
-from data_generate_pipeline import IMAGE_SUFFIXES, load_faultnet, run_faultnet
-from k2_vision_pipeline import K2_FINAL_DIR, run_pipeline
+from seismic_k2.config import IMAGE_SUFFIXES
+from seismic_k2.fault.detection import load_faultnet, run_faultnet
 
 
 DEFAULT_FAULTNET_WEIGHTS = Path("models/faultnet_yolo/best.pt")
 DEFAULT_TEST_ROOT = Path("data/unicamp_namss/test")
+DEFAULT_TRAINED_DIR = Path("outputs/k2_attached_vision/final")
 
 
 def iter_images(root):
@@ -54,7 +55,7 @@ def main():
     )
     parser.add_argument(
         "--trained-dir",
-        default=K2_FINAL_DIR.as_posix(),
+        default=DEFAULT_TRAINED_DIR.as_posix(),
         help="Trained K2 attached vision final folder.",
     )
     parser.add_argument(
@@ -81,6 +82,8 @@ def main():
         ("auxiliary_fault_detected", fault_sample),
         ("no_auxiliary_fault_detected", nonfault_sample),
     ]
+
+    from seismic_k2.vlm.k2_vision import run_pipeline
 
     for name, (image_path, detections) in examples:
         print("=" * 80)

@@ -13,54 +13,24 @@ from torch.utils.data import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
-
-K2_REPO_ID = "daven3/k2"
-K2_MODEL_DIR = Path("models/k2")
-K2_TOKENIZER_NAME = "hf-internal-testing/llama-tokenizer"
-VISION_MODEL_NAME = "unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit"
-VISION_ADAPTER_DIR = Path("outputs/vision_llm_trained/final")
-VISION_PREFIX_PROJECTOR = Path("outputs/k2_qwen_vision_projector.pt")
-K2_VISION_OUTPUT_DIR = Path("outputs/k2_attached_vision")
-GENERATED_DATA_DIR = Path("outputs/generated_unicamp_instructions")
-DEFAULT_TRAIN_JSONL = GENERATED_DATA_DIR / "train_sft.jsonl"
-DEFAULT_EVAL_JSONL = GENERATED_DATA_DIR / "validation_sft.jsonl"
-K2_FINAL_DIR = K2_VISION_OUTPUT_DIR / "final"
-K2_TRAINED_VISION_ADAPTER_DIR = K2_FINAL_DIR / "qwen_vision_adapter"
-K2_TRAINED_PROJECTOR = K2_FINAL_DIR / "k2_qwen_vision_projector.pt"
-K2_TRAINED_LORA_DIR = K2_FINAL_DIR / "k2_lora_adapter"
-NUM_VISION_PREFIX_TOKENS = 8
-VISION_TOKEN_DROP_RATE = 0.75
-
-IMAGE_PROMPT = (
-    "You are encoding a seismic reflection image for a geoscience language model. "
-    "Focus on reflector continuity, amplitude, geometry, offset, chaos, channels, salt, "
-    "and transparency."
+from seismic_k2.config import (
+    DEFAULT_EVAL_JSONL,
+    DEFAULT_TRAIN_JSONL,
+    K2_FINAL_DIR,
+    K2_MODEL_DIR,
+    K2_REPO_ID,
+    K2_TOKENIZER_NAME,
+    K2_TRAINED_LORA_DIR,
+    K2_TRAINED_PROJECTOR,
+    K2_TRAINED_VISION_ADAPTER_DIR,
+    K2_VISION_OUTPUT_DIR,
+    NUM_VISION_PREFIX_TOKENS,
+    VISION_ADAPTER_DIR,
+    VISION_MODEL_NAME,
+    VISION_PREFIX_PROJECTOR,
+    VISION_TOKEN_DROP_RATE,
 )
-
-K2_PROMPT = (
-    "The preceding soft visual prefix comes from a Qwen-VL image encoder that processed "
-    "a seismic reflection image. Interpret the image. Classify it using exactly one of: "
-    "Boring, Bright_Planar, Bright_Chaotic, Channel, Converging_Amplitudes, Fault, Salt, "
-    "Transparent_Planar. Answer in exactly two concise sentences. Sentence 1: <Class>. "
-    "Sentence 2: one visible seismic reason using reflector continuity, amplitude, "
-    "geometry, offset, chaos, or transparency. Do not use markdown or bullets."
-)
-
-K2_VQA_PROMPT_TEMPLATE = (
-    "The preceding soft visual prefix comes from a Qwen-VL image encoder that processed "
-    "a 2D seismic reflection image. Answer the user's seismic interpretation question using "
-    "only visible image evidence. Stay in seismic image interpretation; do not discuss "
-    "seismographs, earthquakes, stations, papers, conferences, or soil dynamics unless the "
-    "image visibly contains that information.\n\n"
-    "Use exactly this format:\n"
-    "Reasoning:\n"
-    "- one short visible seismic clue\n"
-    "- one short visible seismic clue\n"
-    "Final answer: one concise answer grounded in reflector continuity, amplitude, geometry, "
-    "offset, chaos, or transparency.\n\n"
-    "Question: {question}\n"
-    "Answer:"
-)
+from seismic_k2.dataset_generator.prompts import IMAGE_PROMPT, K2_PROMPT, K2_VQA_PROMPT_TEMPLATE
 
 def latest_checkpoint(output_dir):
     output_dir = Path(output_dir)
