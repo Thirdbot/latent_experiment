@@ -252,6 +252,7 @@ def generate_split(
                 QUESTION_PROMPT,
                 max_new_tokens=256,
                 temperature=question_temperature,
+                allow_reasoning_as_content=True,
             )
             answer_prompt = ANSWER_PROMPT_TEMPLATE.format(
                 question=question,

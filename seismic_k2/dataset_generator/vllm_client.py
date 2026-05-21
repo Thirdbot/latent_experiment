@@ -54,7 +54,7 @@ def maybe_add_reasoning(content, reasoning, include_reasoning):
     )
 
 
-def extract_message_text(result, include_reasoning=False):
+def extract_message_text(result, include_reasoning=False, allow_reasoning_as_content=False):
     choices = result.get("choices") or []
     if not choices:
         raise RuntimeError(f"vLLM response did not include choices: {json.dumps(result)[:1000]}")
@@ -71,6 +71,8 @@ def extract_message_text(result, include_reasoning=False):
         return maybe_add_reasoning(content, reasoning, include_reasoning)
 
     if isinstance(reasoning, str) and reasoning.strip():
+        if allow_reasoning_as_content:
+            return reasoning.strip()
         finish_reason = choices[0].get("finish_reason")
         raise RuntimeError(
             "vLLM returned reasoning text but no final assistant content "
@@ -101,7 +103,15 @@ class VLLMClient:
         self.model = model
         self.api_key = api_key
 
-    def generate(self, image, prompt, max_new_tokens=256, temperature=0.0, include_reasoning=False):
+    def generate(
+        self,
+        image,
+        prompt,
+        max_new_tokens=256,
+        temperature=0.0,
+        include_reasoning=False,
+        allow_reasoning_as_content=False,
+    ):
         payload = {
             "model": self.model,
             "messages": [
@@ -131,4 +141,8 @@ class VLLMClient:
         except HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"vLLM HTTP {error.code}: {body}") from error
-        return extract_message_text(result, include_reasoning=include_reasoning)
+        return extract_message_text(
+            result,
+            include_reasoning=include_reasoning,
+            allow_reasoning_as_content=allow_reasoning_as_content,
+        )
