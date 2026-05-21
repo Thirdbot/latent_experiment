@@ -33,7 +33,8 @@ def split_reasoning_answer(text):
 
 def format_reasoning_answer(reasoning, final_answer):
     if reasoning:
-        reasoning_text = "\n".join(f"- {step}" for step in reasoning)
-        return f"Reasoning:\n{reasoning_text}\nFinal answer: {final_answer}"
+        reasoning_steps = [str(step).strip().rstrip(".") for step in reasoning if str(step).strip()]
+        reasoning_text = ". ".join(reasoning_steps)
+        if reasoning_text:
+            return f"{reasoning_text}. {final_answer}"
     return final_answer
-

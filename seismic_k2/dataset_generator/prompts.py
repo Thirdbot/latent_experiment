@@ -66,13 +66,9 @@ K2_VQA_PROMPT_TEMPLATE = (
     "only visible image evidence. Stay in seismic image interpretation; do not discuss "
     "seismographs, earthquakes, stations, papers, conferences, or soil dynamics unless the "
     "image visibly contains that information.\n\n"
-    "Use exactly this format:\n"
-    "Reasoning:\n"
-    "- one short visible seismic clue\n"
-    "- one short visible seismic clue\n"
-    "Final answer: one concise answer grounded in reflector continuity, amplitude, geometry, "
-    "offset, chaos, or transparency.\n\n"
+    "Answer as plain text in one concise paragraph. Do not use JSON, arrays, brackets, markdown, "
+    "bullets, or separate Reasoning and Final answer sections. Include the visible seismic evidence "
+    "inside the same paragraph as the answer.\n\n"
     "Question: {question}\n"
     "Answer:"
 )
-

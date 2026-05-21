@@ -91,7 +91,13 @@ def merge_answers(
         k2_reasoning=json.dumps(k2_reasoning or [], ensure_ascii=False),
         k2_answer=k2_answer,
     )
-    raw = vllm_client.generate(image, prompt, max_new_tokens=384, temperature=temperature)
+    raw = vllm_client.generate(
+        image,
+        prompt,
+        max_new_tokens=768,
+        temperature=temperature,
+        include_reasoning=True,
+    )
     reasoning, final_answer = split_reasoning_answer(raw)
     if not final_answer:
         final_answer = qwen_answer or k2_answer
@@ -244,7 +250,7 @@ def generate_split(
             question = vllm_client.generate(
                 image,
                 QUESTION_PROMPT,
-                max_new_tokens=96,
+                max_new_tokens=256,
                 temperature=question_temperature,
             )
             answer_prompt = ANSWER_PROMPT_TEMPLATE.format(
@@ -254,8 +260,9 @@ def generate_split(
             generator_answer_raw = vllm_client.generate(
                 image,
                 answer_prompt,
-                max_new_tokens=384,
+                max_new_tokens=768,
                 temperature=answer_temperature,
+                include_reasoning=True,
             )
             generator_reasoning, generator_answer = split_reasoning_answer(generator_answer_raw)
             if k2_responder is not None:
