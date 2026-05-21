@@ -193,9 +193,11 @@ def add_k2_lora(model, r=8, alpha=16, dropout=0.05):
 
 
 def load_qwen_vision_encoder(trainable=False, adapter_dir=None):
+    device_map = {"": 0} if torch.cuda.is_available() else None
     model, processor = FastVisionModel.from_pretrained(
         VISION_MODEL_NAME,
         load_in_4bit=True,
+        device_map=device_map,
         use_gradient_checkpointing="unsloth",
     )
 
