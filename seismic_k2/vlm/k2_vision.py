@@ -221,10 +221,19 @@ def load_qwen_vision_encoder(trainable=False, adapter_dir=None):
         print(f"vision adapter not found at {adapter_dir}; using base Qwen-VL")
 
     if trainable:
-        for name, param in model.named_parameters():
-            is_language_param = "language" in name or "lm_head" in name or "embed_tokens" in name
-            can_train = param.is_floating_point() or param.is_complex()
-            param.requires_grad = can_train and not is_language_param
+        if not isinstance(model, PeftModel):
+            model = FastVisionModel.get_peft_model(
+                model,
+                finetune_vision_layers=True,
+                finetune_language_layers=False,
+                finetune_attention_modules=True,
+                finetune_mlp_modules=True,
+                r=8,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                bias="none",
+                use_gradient_checkpointing="unsloth",
+            )
         trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
         total_params = sum(param.numel() for param in model.parameters())
         print(f"Qwen trainable params: {trainable_params:,} / {total_params:,}")
@@ -655,7 +664,10 @@ class FrozenK2VisionModel(nn.Module):
     def save_pretrained(self, output_dir):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        self.qwen_model.save_pretrained(output_dir / "qwen_vision_adapter")
+        if isinstance(self.qwen_model, PeftModel):
+            self.qwen_model.save_pretrained(output_dir / "qwen_vision_adapter")
+        else:
+            print("skipping full Qwen save; qwen_model is not a PEFT adapter")
         if isinstance(self.k2_model, PeftModel):
             self.k2_model.save_pretrained(output_dir / "k2_lora_adapter")
         torch.save(self.projector.state_dict(), output_dir / "k2_qwen_vision_projector.pt")
