@@ -94,9 +94,10 @@ def merge_answers(
     raw = vllm_client.generate(
         image,
         prompt,
-        max_new_tokens=768,
+        max_new_tokens=1536,
         temperature=temperature,
         include_reasoning=True,
+        allow_reasoning_as_content=True,
     )
     reasoning, final_answer = split_reasoning_answer(raw)
     if not final_answer:
@@ -261,9 +262,10 @@ def generate_split(
             generator_answer_raw = vllm_client.generate(
                 image,
                 answer_prompt,
-                max_new_tokens=768,
+                max_new_tokens=1536,
                 temperature=answer_temperature,
                 include_reasoning=True,
+                allow_reasoning_as_content=True,
             )
             generator_reasoning, generator_answer = split_reasoning_answer(generator_answer_raw)
             if k2_responder is not None:
