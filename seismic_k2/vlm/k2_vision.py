@@ -38,6 +38,7 @@ from seismic_k2.dataset_generator.prompts import IMAGE_PROMPT, K2_PROMPT, K2_VQA
 FAULT_OVERLAY_SIZE = 32
 FAULT_OVERLAY_LOSS_WEIGHT = 0.25
 FAULT_PRESENCE_LOSS_WEIGHT = 0.10
+DEFAULT_MAX_IMAGE_SIDE = 512
 REAL_MASK_FIELDS = (
     "fault_mask_path",
     "mask_path",
@@ -388,12 +389,7 @@ def encode_image_with_qwen(qwen_model, qwen_processor, image, token_drop_rate=0.
     image_token_id = get_image_token_id(qwen_model, qwen_processor)
 
     with torch.no_grad():
-        outputs = qwen_model(
-            **inputs,
-            output_hidden_states=True,
-            return_dict=True,
-            use_cache=False,
-        )
+        outputs = qwen_forward_hidden_states(qwen_model, inputs)
 
     hidden_states = outputs.hidden_states[-1]
     image_mask = inputs["input_ids"].eq(image_token_id)
@@ -408,12 +404,7 @@ def encode_image_with_qwen(qwen_model, qwen_processor, image, token_drop_rate=0.
 
 def encode_qwen_inputs(qwen_model, qwen_processor, inputs, token_drop_rate=VISION_TOKEN_DROP_RATE, return_tokens=False):
     image_token_id = get_image_token_id(qwen_model, qwen_processor)
-    outputs = qwen_model(
-        **inputs,
-        output_hidden_states=True,
-        return_dict=True,
-        use_cache=False,
-    )
+    outputs = qwen_forward_hidden_states(qwen_model, inputs)
     hidden_states = outputs.hidden_states[-1]
     image_mask = inputs["input_ids"].eq(image_token_id)
     image_mask = apply_image_token_dropout(
@@ -426,6 +417,24 @@ def encode_qwen_inputs(qwen_model, qwen_processor, inputs, token_drop_rate=VISIO
     if not return_tokens:
         return vision_latent
     return vision_latent, hidden_states, image_mask
+
+
+def qwen_forward_hidden_states(qwen_model, inputs):
+    kwargs = {
+        **inputs,
+        "output_hidden_states": True,
+        "return_dict": True,
+        "use_cache": False,
+        # Qwen-VL otherwise computes full vocabulary logits even though this
+        # path only needs hidden states. Keeping one logit position avoids a
+        # multi-GB lm_head allocation on 24GB GPUs.
+        "logits_to_keep": 1,
+    }
+    try:
+        return qwen_model(**kwargs)
+    except TypeError:
+        kwargs.pop("logits_to_keep", None)
+        return qwen_model(**kwargs)
 
 
 def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt):
@@ -542,6 +551,18 @@ def get_question(record):
         texts = [item.get("text", "") for item in content if item.get("type") == "text"]
         return "\n".join(texts).strip()
     return K2_PROMPT
+
+
+def resize_image_for_training(image, max_side=DEFAULT_MAX_IMAGE_SIDE):
+    if max_side is None or max_side <= 0:
+        return image
+    width, height = image.size
+    longest = max(width, height)
+    if longest <= max_side:
+        return image
+    scale = max_side / float(longest)
+    new_size = (max(int(round(width * scale)), 1), max(int(round(height * scale)), 1))
+    return image.resize(new_size, Image.Resampling.BICUBIC)
 
 
 def resolve_record_path(record, value):
@@ -692,11 +713,12 @@ def point_in_polygon(x, y, points):
 
 
 class K2VisionDataset(Dataset):
-    def __init__(self, jsonl_path, allow_pseudo_fault_labels=False):
+    def __init__(self, jsonl_path, allow_pseudo_fault_labels=False, max_image_side=DEFAULT_MAX_IMAGE_SIDE):
         jsonl_path = Path(jsonl_path)
         if not jsonl_path.exists():
             raise FileNotFoundError(f"Generated SFT JSONL not found: {jsonl_path}")
         self.allow_pseudo_fault_labels = allow_pseudo_fault_labels
+        self.max_image_side = max_image_side
         self.records = []
         with jsonl_path.open("r", encoding="utf-8") as file:
             for line in file:
@@ -724,11 +746,13 @@ class K2VisionDataset(Dataset):
         record = self.records[index]
         image_path = Path(record["image"])
         image = Image.open(image_path).convert("RGB")
+        original_size = image.size
+        image = resize_image_for_training(image, self.max_image_side)
         answer = get_message_text(record.get("messages", [])) or record.get("chosen_answer", "")
         question = get_question(record)
         fault_overlay, fault_presence, fault_valid, fault_source = rasterize_fault_target(
             record,
-            image.size,
+            original_size,
             allow_pseudo_labels=self.allow_pseudo_fault_labels,
         )
         return {
@@ -921,10 +945,20 @@ class FrozenK2VisionModel(nn.Module):
         self.vision_token_drop_rate = vision_token_drop_rate
         self.fault_overlay_loss_weight = fault_overlay_loss_weight
         self.fault_presence_loss_weight = fault_presence_loss_weight
+        self.qwen_trainable = any(param.requires_grad for param in self.qwen_model.parameters())
+        if not self.qwen_trainable:
+            self.qwen_model.eval()
 
         self.k2_model.eval()
         for name, param in self.k2_model.named_parameters():
             param.requires_grad = param.requires_grad and "lora_" in name
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if not self.qwen_trainable:
+            self.qwen_model.eval()
+        self.k2_model.eval()
+        return self
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         if hasattr(self.qwen_model, "gradient_checkpointing_enable"):
@@ -986,13 +1020,23 @@ class FrozenK2VisionModel(nn.Module):
             for key, value in batch.items()
             if key.startswith("qwen_")
         }
-        vision_latent, vision_tokens, image_mask = encode_qwen_inputs(
-            self.qwen_model,
-            self.qwen_processor,
-            qwen_inputs,
-            token_drop_rate=self.vision_token_drop_rate,
-            return_tokens=True,
-        )
+        if self.qwen_trainable:
+            vision_latent, vision_tokens, image_mask = encode_qwen_inputs(
+                self.qwen_model,
+                self.qwen_processor,
+                qwen_inputs,
+                token_drop_rate=self.vision_token_drop_rate,
+                return_tokens=True,
+            )
+        else:
+            with torch.no_grad():
+                vision_latent, vision_tokens, image_mask = encode_qwen_inputs(
+                    self.qwen_model,
+                    self.qwen_processor,
+                    qwen_inputs,
+                    token_drop_rate=self.vision_token_drop_rate,
+                    return_tokens=True,
+                )
         fault_outputs = {}
         if self.fault_overlay_head is not None:
             head_device = next(self.fault_overlay_head.parameters()).device
@@ -1336,6 +1380,8 @@ def train_attached_vision(
     k2_lora_r=8,
     train_fault_overlay_head=True,
     allow_pseudo_fault_labels=False,
+    train_qwen_vision_adapter=True,
+    max_image_side=DEFAULT_MAX_IMAGE_SIDE,
 ):
     output_dir = Path(output_dir)
     final_dir = final_dir_for(output_dir)
@@ -1351,7 +1397,7 @@ def train_attached_vision(
         VISION_PREFIX_PROJECTOR,
     )
     qwen_model, qwen_processor = load_qwen_vision_encoder(
-        trainable=True,
+        trainable=train_qwen_vision_adapter,
         adapter_dir=vision_adapter_dir,
     )
     k2_lora_dir = resolve_existing_path(
@@ -1395,8 +1441,21 @@ def train_attached_vision(
         vision_token_drop_rate=vision_token_drop_rate,
     )
 
-    train_dataset = K2VisionDataset(train_jsonl, allow_pseudo_fault_labels=allow_pseudo_fault_labels)
-    eval_dataset = K2VisionDataset(eval_jsonl, allow_pseudo_fault_labels=allow_pseudo_fault_labels) if do_eval else None
+    train_dataset = K2VisionDataset(
+        train_jsonl,
+        allow_pseudo_fault_labels=allow_pseudo_fault_labels,
+        max_image_side=max_image_side,
+    )
+    eval_dataset = (
+        K2VisionDataset(
+            eval_jsonl,
+            allow_pseudo_fault_labels=allow_pseudo_fault_labels,
+            max_image_side=max_image_side,
+        )
+        if do_eval
+        else None
+    )
+    print(f"max image side for Qwen training inputs: {max_image_side}")
     print(f"train fault label sources: {train_dataset.fault_label_source_counts}")
     if train_fault_overlay_head and train_dataset.fault_label_source_counts["real"] == 0:
         if train_dataset.fault_label_source_counts["pseudo"] > 0:
@@ -1533,6 +1592,12 @@ def main():
         help="Image-token drop rate during training. Default drops 75 percent.",
     )
     train_parser.add_argument(
+        "--max-image-side",
+        type=int,
+        default=DEFAULT_MAX_IMAGE_SIDE,
+        help="Resize training images so the longest side is at most this many pixels before Qwen processing. Use 0 to disable.",
+    )
+    train_parser.add_argument(
         "--train-jsonl",
         default=DEFAULT_TRAIN_JSONL.as_posix(),
         help="Generated SFT JSONL for training, usually outputs/generated_unicamp_instructions/train_sft.jsonl.",
@@ -1586,6 +1651,11 @@ def main():
         action="store_true",
         help="Allow FaultNet detections as weak labels when real fault masks/YOLO labels are unavailable.",
     )
+    train_parser.add_argument(
+        "--freeze-qwen-vision-adapter",
+        action="store_true",
+        help="Freeze Qwen vision during training. This is the safest 24GB-GPU mode; trains projector, K2 LoRA, and fault head.",
+    )
 
     args = parser.parse_args()
     if args.command == "run":
@@ -1617,6 +1687,8 @@ def main():
             args.k2_lora_r,
             not args.no_fault_overlay_head,
             args.allow_pseudo_fault_labels,
+            not args.freeze_qwen_vision_adapter,
+            args.max_image_side,
         )
 
 
