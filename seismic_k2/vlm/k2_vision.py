@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+import shutil
 
 import unsloth
 import numpy as np
@@ -92,6 +93,26 @@ def has_k2_vision_checkpoint_parts(checkpoint_dir):
         checkpoint_dir / "k2_lora_adapter" / "adapter_model.bin",
     )
     return any(path.exists() for path in paths)
+
+
+def quarantine_trainer_state_for_retry(checkpoint_dir):
+    checkpoint_dir = Path(checkpoint_dir)
+    moved = []
+    for filename in ("optimizer.pt", "scheduler.pt", "scaler.pt", "rng_state.pth"):
+        path = checkpoint_dir / filename
+        if path.exists():
+            backup = checkpoint_dir / f"{filename}.incompatible"
+            if backup.exists():
+                backup.unlink()
+            shutil.move(path.as_posix(), backup.as_posix())
+            moved.append((path, backup))
+    return moved
+
+
+def restore_quarantined_trainer_state(moved):
+    for path, backup in moved:
+        if backup.exists() and not path.exists():
+            shutil.move(backup.as_posix(), path.as_posix())
 
 
 def final_dir_for(output_dir):
@@ -1525,7 +1546,21 @@ def train_attached_vision(
         eval_dataset=eval_dataset,
         data_collator=K2VisionCollator(qwen_processor, k2_tokenizer, max_length=k2_max_length),
     )
-    trainer.train(resume_from_checkpoint=latest_checkpoint(output_dir))
+    resume_checkpoint = latest_checkpoint(output_dir)
+    try:
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
+    except ValueError as error:
+        if resume_checkpoint is None or "parameter group" not in str(error):
+            raise
+        print(
+            "optimizer state is incompatible with the current trainable parameter set; "
+            "retrying from checkpoint model weights without optimizer/scheduler state."
+        )
+        moved = quarantine_trainer_state_for_retry(resume_checkpoint)
+        try:
+            trainer.train(resume_from_checkpoint=resume_checkpoint)
+        finally:
+            restore_quarantined_trainer_state(moved)
     if do_eval:
         trainer.evaluate()
     save_training_history(trainer.state.log_history, output_dir)
