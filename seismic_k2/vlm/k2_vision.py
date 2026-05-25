@@ -124,6 +124,25 @@ def resolve_existing_path(*paths):
     return None
 
 
+def has_peft_adapter(path):
+    path = Path(path)
+    return (
+        path.exists()
+        and (path / "adapter_config.json").exists()
+        and (
+            (path / "adapter_model.safetensors").exists()
+            or (path / "adapter_model.bin").exists()
+        )
+    )
+
+
+def resolve_existing_peft_adapter(*paths):
+    for path in paths:
+        if path is not None and has_peft_adapter(path):
+            return Path(path)
+    return None
+
+
 def k2_repo_is_complete(model_dir):
     model_dir = Path(model_dir)
     config_path = model_dir / "config.json"
@@ -207,13 +226,15 @@ def load_k2(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME, lora_adapt
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True,
     )
-    if lora_adapter_dir is not None and Path(lora_adapter_dir).exists():
+    if lora_adapter_dir is not None and has_peft_adapter(lora_adapter_dir):
         model = PeftModel.from_pretrained(
             model,
             Path(lora_adapter_dir).as_posix(),
             is_trainable=is_trainable,
         )
         print(f"loaded K2 LoRA adapter from {lora_adapter_dir}")
+    elif lora_adapter_dir is not None:
+        print(f"K2 LoRA adapter not found or incomplete at {lora_adapter_dir}; using base K2")
     model.eval()
     return model, tokenizer
 
@@ -246,10 +267,10 @@ def load_qwen_vision_encoder(trainable=False, adapter_dir=None):
     )
 
     if adapter_dir is None:
-        adapter_dir = resolve_existing_path(K2_TRAINED_VISION_ADAPTER_DIR, VISION_ADAPTER_DIR)
+        adapter_dir = resolve_existing_peft_adapter(K2_TRAINED_VISION_ADAPTER_DIR, VISION_ADAPTER_DIR)
     else:
         adapter_dir = Path(adapter_dir)
-    has_vision_adapter = adapter_dir.exists()
+    has_vision_adapter = adapter_dir is not None and has_peft_adapter(adapter_dir)
     if has_vision_adapter:
         model = PeftModel.from_pretrained(
             model,
@@ -262,7 +283,7 @@ def load_qwen_vision_encoder(trainable=False, adapter_dir=None):
             model = model.merge_and_unload()
             print(f"merged Qwen vision adapter from {adapter_dir}")
     else:
-        print(f"vision adapter not found at {adapter_dir}; using base Qwen-VL")
+        print(f"vision adapter not found or incomplete at {adapter_dir}; using base Qwen-VL")
 
     if trainable:
         if not isinstance(model, PeftModel):
@@ -1271,11 +1292,14 @@ def run_pipeline(
         fault_overlay_head_path,
         trained_dir / "fault_overlay_head.pt",
     )
+    if vision_adapter_dir is not None and not has_peft_adapter(vision_adapter_dir):
+        print(f"ignoring incomplete Qwen vision adapter directory: {vision_adapter_dir}")
+        vision_adapter_dir = resolve_existing_peft_adapter(K2_TRAINED_VISION_ADAPTER_DIR, VISION_ADAPTER_DIR)
     qwen_model, qwen_processor = load_qwen_vision_encoder(adapter_dir=vision_adapter_dir)
     k2_lora_dir = trained_dir / "k2_lora_adapter"
     k2_model, k2_tokenizer = load_k2(
         k2_dir,
-        lora_adapter_dir=k2_lora_dir if k2_lora_dir.exists() else None,
+        lora_adapter_dir=k2_lora_dir if has_peft_adapter(k2_lora_dir) else None,
     )
 
     vision_hidden_size = get_hidden_size(qwen_model)
@@ -1390,6 +1414,9 @@ def train_attached_vision(
         K2_TRAINED_VISION_ADAPTER_DIR,
         VISION_ADAPTER_DIR,
     )
+    if vision_adapter_dir is not None and not has_peft_adapter(vision_adapter_dir):
+        print(f"ignoring incomplete Qwen vision adapter directory: {vision_adapter_dir}")
+        vision_adapter_dir = resolve_existing_peft_adapter(K2_TRAINED_VISION_ADAPTER_DIR, VISION_ADAPTER_DIR)
     projector_path = resolve_existing_path(
         projector_path,
         projector_path_for(output_dir),
@@ -1404,9 +1431,12 @@ def train_attached_vision(
         k2_lora_dir_for(output_dir),
         K2_TRAINED_LORA_DIR,
     )
+    if k2_lora_dir is not None and not has_peft_adapter(k2_lora_dir):
+        print(f"ignoring incomplete K2 LoRA adapter directory: {k2_lora_dir}")
+        k2_lora_dir = resolve_existing_peft_adapter(K2_TRAINED_LORA_DIR)
     k2_model, k2_tokenizer = load_k2(
         k2_dir,
-        lora_adapter_dir=k2_lora_dir if train_k2_lora and k2_lora_dir.exists() else None,
+        lora_adapter_dir=k2_lora_dir if train_k2_lora and k2_lora_dir is not None else None,
         is_trainable=train_k2_lora,
     )
     if train_k2_lora:
