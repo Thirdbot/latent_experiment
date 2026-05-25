@@ -1061,10 +1061,11 @@ class FrozenK2VisionModel(nn.Module):
         fault_outputs = {}
         if self.fault_overlay_head is not None:
             head_device = next(self.fault_overlay_head.parameters()).device
+            head_dtype = next(self.fault_overlay_head.parameters()).dtype
             fault_outputs = self.fault_overlay_head(
-                vision_tokens.to(head_device),
+                vision_tokens.to(device=head_device, dtype=head_dtype),
                 image_mask.to(head_device),
-                vision_latent.to(head_device),
+                vision_latent.to(device=head_device, dtype=head_dtype),
             )
 
         projector_device = next(self.projector.parameters()).device
@@ -1354,10 +1355,11 @@ def run_pipeline(
                 return_tokens=True,
             )
             head_device = next(fault_overlay_head.parameters()).device
+            head_dtype = next(fault_overlay_head.parameters()).dtype
             fault_outputs = fault_overlay_head(
-                vision_tokens.to(head_device),
+                vision_tokens.to(device=head_device, dtype=head_dtype),
                 image_mask.to(head_device),
-                qwen_vision_latent.to(head_device),
+                qwen_vision_latent.to(device=head_device, dtype=head_dtype),
             )
     qwen_vision_latent = qwen_vision_latent.to(
         device=next(projector.parameters()).device,
