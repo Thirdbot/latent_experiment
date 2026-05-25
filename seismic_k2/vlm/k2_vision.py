@@ -39,6 +39,8 @@ from seismic_k2.dataset_generator.prompts import IMAGE_PROMPT, K2_PROMPT, K2_VQA
 FAULT_OVERLAY_SIZE = 32
 FAULT_OVERLAY_LOSS_WEIGHT = 0.25
 FAULT_PRESENCE_LOSS_WEIGHT = 0.10
+FAULT_POS_WEIGHT = 20.0
+FAULT_FOCAL_GAMMA = 2.0
 DEFAULT_MAX_IMAGE_SIDE = 512
 REAL_MASK_FIELDS = (
     "fault_mask_path",
@@ -755,12 +757,19 @@ def point_in_polygon(x, y, points):
 
 
 class K2VisionDataset(Dataset):
-    def __init__(self, jsonl_path, allow_pseudo_fault_labels=False, max_image_side=DEFAULT_MAX_IMAGE_SIDE):
+    def __init__(
+        self,
+        jsonl_path,
+        allow_pseudo_fault_labels=False,
+        max_image_side=DEFAULT_MAX_IMAGE_SIDE,
+        fault_output_size=FAULT_OVERLAY_SIZE,
+    ):
         jsonl_path = Path(jsonl_path)
         if not jsonl_path.exists():
             raise FileNotFoundError(f"Generated SFT JSONL not found: {jsonl_path}")
         self.allow_pseudo_fault_labels = allow_pseudo_fault_labels
         self.max_image_side = max_image_side
+        self.fault_output_size = fault_output_size
         self.records = []
         with jsonl_path.open("r", encoding="utf-8") as file:
             for line in file:
@@ -795,6 +804,7 @@ class K2VisionDataset(Dataset):
         fault_overlay, fault_presence, fault_valid, fault_source = rasterize_fault_target(
             record,
             original_size,
+            output_size=self.fault_output_size,
             allow_pseudo_labels=self.allow_pseudo_fault_labels,
         )
         return {
@@ -966,6 +976,24 @@ def load_or_create_fault_overlay_head(vision_hidden_size, head_path=None, output
     return head
 
 
+def load_fault_overlay_head_compatible(vision_hidden_size, head_path=None, output_size=FAULT_OVERLAY_SIZE):
+    head = FaultOverlayHead(vision_hidden_size, output_size=output_size)
+    if head_path is None or not Path(head_path).exists():
+        if head_path is not None:
+            print(f"fault overlay head not found at {head_path}; using randomly initialized head")
+        return head
+    state = torch.load(head_path, map_location="cpu")
+    try:
+        head.load_state_dict(state)
+        print(f"loaded fault overlay head from {head_path}")
+    except RuntimeError as error:
+        print(
+            f"fault overlay head at {head_path} is incompatible with output_size={output_size}; "
+            f"using randomly initialized head. Details: {error}"
+        )
+    return head
+
+
 class FrozenK2VisionModel(nn.Module):
     def __init__(
         self,
@@ -977,6 +1005,8 @@ class FrozenK2VisionModel(nn.Module):
         vision_token_drop_rate=VISION_TOKEN_DROP_RATE,
         fault_overlay_loss_weight=FAULT_OVERLAY_LOSS_WEIGHT,
         fault_presence_loss_weight=FAULT_PRESENCE_LOSS_WEIGHT,
+        fault_pos_weight=FAULT_POS_WEIGHT,
+        fault_focal_gamma=FAULT_FOCAL_GAMMA,
     ):
         super().__init__()
         self.qwen_model = qwen_model
@@ -987,6 +1017,8 @@ class FrozenK2VisionModel(nn.Module):
         self.vision_token_drop_rate = vision_token_drop_rate
         self.fault_overlay_loss_weight = fault_overlay_loss_weight
         self.fault_presence_loss_weight = fault_presence_loss_weight
+        self.fault_pos_weight = fault_pos_weight
+        self.fault_focal_gamma = fault_focal_gamma
         self.qwen_trainable = any(param.requires_grad for param in self.qwen_model.parameters())
         if not self.qwen_trainable:
             self.qwen_model.eval()
@@ -1140,9 +1172,11 @@ class FrozenK2VisionModel(nn.Module):
             if valid_indices.any():
                 overlay_logits = fault_outputs["fault_overlay_logits"][valid_indices]
                 presence_logits = fault_outputs["fault_presence_logits"][valid_indices]
-                overlay_loss = F.binary_cross_entropy_with_logits(
+                overlay_loss = weighted_focal_bce_with_logits(
                     overlay_logits,
                     target_overlay[valid_indices],
+                    pos_weight=self.fault_pos_weight,
+                    gamma=self.fault_focal_gamma,
                 )
                 dice = dice_loss_from_logits(overlay_logits, target_overlay[valid_indices])
                 presence_loss = F.binary_cross_entropy_with_logits(
@@ -1170,6 +1204,18 @@ def dice_loss_from_logits(logits, target):
     return (1 - (2 * intersection + 1e-6) / (denominator + 1e-6)).mean()
 
 
+def weighted_focal_bce_with_logits(logits, target, pos_weight=FAULT_POS_WEIGHT, gamma=FAULT_FOCAL_GAMMA):
+    weights = torch.ones_like(target)
+    weights = torch.where(target > 0.5, weights * pos_weight, weights)
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    if gamma <= 0:
+        return (bce * weights).mean()
+    prob = torch.sigmoid(logits)
+    pt = torch.where(target > 0.5, prob, 1.0 - prob)
+    focal = (1.0 - pt).clamp_min(1e-6).pow(gamma)
+    return (bce * weights * focal).mean()
+
+
 def save_fault_overlay_prediction(image, overlay_prob, output_path, threshold=0.5, alpha=0.45):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1191,6 +1237,17 @@ def save_fault_overlay_prediction(image, overlay_prob, output_path, threshold=0.
     overlay[hard_mask] = overlay[hard_mask] * 0.65 + heat[hard_mask] * 0.35
 
     Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8)).save(output_path)
+    return output_path
+
+
+def save_fault_mask_prediction(overlay_prob, output_path, size=None):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    mask = overlay_prob.detach().float().cpu().squeeze().clamp(0, 1).numpy()
+    mask_image = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+    if size is not None:
+        mask_image = mask_image.resize(size, Image.Resampling.BILINEAR)
+    mask_image.save(output_path)
     return output_path
 
 
@@ -1292,6 +1349,7 @@ def run_pipeline(
     vision_adapter_dir=None,
     fault_overlay_head_path=None,
     fault_overlay_output=None,
+    fault_mask_output=None,
     fault_overlay_threshold=0.5,
     vision_token_drop_rate=0.0,
     question=None,
@@ -1335,7 +1393,7 @@ def run_pipeline(
     projector.eval()
     fault_overlay_head = None
     if fault_overlay_head_path is not None and fault_overlay_head_path.exists():
-        fault_overlay_head = load_or_create_fault_overlay_head(vision_hidden_size, fault_overlay_head_path)
+        fault_overlay_head = load_fault_overlay_head_compatible(vision_hidden_size, fault_overlay_head_path)
         fault_overlay_head = fault_overlay_head.to(k2_model.get_input_embeddings().weight.device)
         fault_overlay_head.eval()
 
@@ -1410,6 +1468,13 @@ def run_pipeline(
                 threshold=fault_overlay_threshold,
             )
             print(f"fault_overlay_output: {output_path}")
+        if fault_mask_output is not None:
+            output_path = save_fault_mask_prediction(
+                overlay[0],
+                fault_mask_output,
+                size=image.size,
+            )
+            print(f"fault_mask_output: {output_path}")
 
 
 def train_attached_vision(
@@ -1429,6 +1494,11 @@ def train_attached_vision(
     allow_pseudo_fault_labels=False,
     train_qwen_vision_adapter=True,
     max_image_side=DEFAULT_MAX_IMAGE_SIDE,
+    fault_output_size=FAULT_OVERLAY_SIZE,
+    fault_overlay_loss_weight=1.0,
+    fault_presence_loss_weight=0.5,
+    fault_pos_weight=FAULT_POS_WEIGHT,
+    fault_focal_gamma=FAULT_FOCAL_GAMMA,
 ):
     output_dir = Path(output_dir)
     final_dir = final_dir_for(output_dir)
@@ -1478,9 +1548,10 @@ def train_attached_vision(
     projector.train()
     fault_overlay_head = None
     if train_fault_overlay_head:
-        fault_overlay_head = load_or_create_fault_overlay_head(
+        fault_overlay_head = load_fault_overlay_head_compatible(
             vision_hidden_size,
             fault_overlay_head_path_for(output_dir),
+            output_size=fault_output_size,
         )
         fault_overlay_head = fault_overlay_head.to(k2_model.get_input_embeddings().weight.device)
         fault_overlay_head.train()
@@ -1492,23 +1563,34 @@ def train_attached_vision(
         projector=projector,
         fault_overlay_head=fault_overlay_head,
         vision_token_drop_rate=vision_token_drop_rate,
+        fault_overlay_loss_weight=fault_overlay_loss_weight,
+        fault_presence_loss_weight=fault_presence_loss_weight,
+        fault_pos_weight=fault_pos_weight,
+        fault_focal_gamma=fault_focal_gamma,
     )
 
     train_dataset = K2VisionDataset(
         train_jsonl,
         allow_pseudo_fault_labels=allow_pseudo_fault_labels,
         max_image_side=max_image_side,
+        fault_output_size=fault_output_size,
     )
     eval_dataset = (
         K2VisionDataset(
             eval_jsonl,
             allow_pseudo_fault_labels=allow_pseudo_fault_labels,
             max_image_side=max_image_side,
+            fault_output_size=fault_output_size,
         )
         if do_eval
         else None
     )
     print(f"max image side for Qwen training inputs: {max_image_side}")
+    print(
+        "fault head config: "
+        f"output_size={fault_output_size}, overlay_weight={fault_overlay_loss_weight}, "
+        f"presence_weight={fault_presence_loss_weight}, pos_weight={fault_pos_weight}, focal_gamma={fault_focal_gamma}"
+    )
     print(f"train fault label sources: {train_dataset.fault_label_source_counts}")
     if train_fault_overlay_head and train_dataset.fault_label_source_counts["real"] == 0:
         if train_dataset.fault_label_source_counts["pseudo"] > 0:
@@ -1619,6 +1701,11 @@ def main():
         help="Optional PNG path for the predicted model fault overlay.",
     )
     run_parser.add_argument(
+        "--fault-mask-output",
+        default=None,
+        help="Optional grayscale PNG path for the raw predicted fault probability mask.",
+    )
+    run_parser.add_argument(
         "--fault-overlay-threshold",
         type=float,
         default=0.5,
@@ -1663,6 +1750,12 @@ def main():
         type=int,
         default=DEFAULT_MAX_IMAGE_SIDE,
         help="Resize training images so the longest side is at most this many pixels before Qwen processing. Use 0 to disable.",
+    )
+    train_parser.add_argument(
+        "--fault-output-size",
+        type=int,
+        default=FAULT_OVERLAY_SIZE,
+        help="Fault overlay output resolution. Use 64 for sharper quick-run heatmaps if memory permits.",
     )
     train_parser.add_argument(
         "--train-jsonl",
@@ -1718,6 +1811,10 @@ def main():
         action="store_true",
         help="Allow FaultNet detections as weak labels when real fault masks/YOLO labels are unavailable.",
     )
+    train_parser.add_argument("--fault-overlay-loss-weight", type=float, default=1.0)
+    train_parser.add_argument("--fault-presence-loss-weight", type=float, default=0.5)
+    train_parser.add_argument("--fault-pos-weight", type=float, default=FAULT_POS_WEIGHT)
+    train_parser.add_argument("--fault-focal-gamma", type=float, default=FAULT_FOCAL_GAMMA)
     train_parser.add_argument(
         "--freeze-qwen-vision-adapter",
         action="store_true",
@@ -1734,6 +1831,7 @@ def main():
             Path(args.vision_adapter) if args.vision_adapter else None,
             Path(args.fault_overlay_head) if args.fault_overlay_head else None,
             Path(args.fault_overlay_output) if args.fault_overlay_output else None,
+            Path(args.fault_mask_output) if args.fault_mask_output else None,
             args.fault_overlay_threshold,
             args.vision_token_drop_rate,
             args.question,
@@ -1756,6 +1854,11 @@ def main():
             args.allow_pseudo_fault_labels,
             not args.freeze_qwen_vision_adapter,
             args.max_image_side,
+            args.fault_output_size,
+            args.fault_overlay_loss_weight,
+            args.fault_presence_loss_weight,
+            args.fault_pos_weight,
+            args.fault_focal_gamma,
         )
 
 
