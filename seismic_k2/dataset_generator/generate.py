@@ -17,6 +17,7 @@ from seismic_k2.dataset_generator.prompts import (
     QUESTION_PROMPT,
 )
 from seismic_k2.dataset_generator.text_utils import format_reasoning_answer, split_reasoning_answer
+from seismic_k2.dataset_generator.nli import verify_generated_dataset
 from seismic_k2.dataset_generator.vllm_client import VLLMClient
 from seismic_k2.fault.detection import load_faultnet, run_faultnet
 
@@ -117,6 +118,7 @@ def build_sft_record(
     merged_reasoning,
     merged_answer,
     answer_source,
+    detections=None,
 ):
     user_message = {
         "role": "user",
@@ -129,6 +131,7 @@ def build_sft_record(
         "image": str(image_path),
         "question": question,
         "answer_source": answer_source,
+        "faultnet_detections": detections or [],
         "reasoning": merged_reasoning or [],
         "answer": merged_answer,
         "messages": [
@@ -295,6 +298,7 @@ def generate_split(
                 merged_reasoning=merged_reasoning,
                 merged_answer=merged_answer,
                 answer_source=answer_source,
+                detections=detections,
             )
             record = build_instruction_record(
                 image_path=image_path,
@@ -370,6 +374,16 @@ def main():
         help="YOLO/FaultNet confidence threshold. Lower values are useful for Unicamp domain shift.",
     )
     parser.add_argument(
+        "--verify-nli",
+        action="store_true",
+        help="After each split is generated, write NLI-verified and filtered JSONL files.",
+    )
+    parser.add_argument(
+        "--nli-model",
+        default=None,
+        help="Optional local seismic NLI verifier model. If omitted with --verify-nli, uses deterministic rules.",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
@@ -423,11 +437,12 @@ def main():
             projector_path=Path(args.projector),
         )
 
+    output_dir = Path(args.output_dir)
     for split in args.splits:
         generate_split(
             split=split,
             data_root=Path(args.data_root),
-            output_dir=Path(args.output_dir),
+            output_dir=output_dir,
             vllm_client=vllm_client,
             k2_responder=k2_responder,
             faultnet=faultnet,
@@ -437,6 +452,15 @@ def main():
             answer_temperature=args.answer_temperature,
             merge_temperature=args.merge_temperature,
         )
+        if args.verify_nli:
+            input_path = output_dir / f"{split}.jsonl"
+            summary = verify_generated_dataset(
+                input_path=input_path,
+                output_path=output_dir / f"{split}_verified.jsonl",
+                filtered_output_path=output_dir / f"{split}_filtered.jsonl",
+                model_path=Path(args.nli_model) if args.nli_model else None,
+            )
+            print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
