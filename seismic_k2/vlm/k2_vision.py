@@ -1,24 +1,24 @@
-import argparse
 import json
+import os
 from pathlib import Path
-import shutil
+import time
 
 import unsloth
 import numpy as np
 import torch
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
-from peft import LoraConfig, PeftModel, TaskType, get_peft_model, load_peft_weights, set_peft_model_state_dict
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+from peft import prepare_model_for_kbit_training
 from PIL import Image
 from torch import nn
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, LlamaTokenizer
 from unsloth import FastVisionModel, is_bfloat16_supported
-from torch.utils.data import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, Trainer, TrainingArguments
-from transformers.trainer_utils import get_last_checkpoint
 
 from seismic_k2.config import (
-    DEFAULT_EVAL_JSONL,
-    DEFAULT_TRAIN_JSONL,
+    DEFAULT_EVAL_DATA,
+    DEFAULT_TRAIN_DATA,
     K2_FINAL_DIR,
     K2_MODEL_DIR,
     K2_REPO_ID,
@@ -33,88 +33,24 @@ from seismic_k2.config import (
     VISION_PREFIX_PROJECTOR,
     VISION_TOKEN_DROP_RATE,
 )
-from seismic_k2.dataset_generator.prompts import IMAGE_PROMPT, K2_PROMPT, K2_VQA_PROMPT_TEMPLATE
+from seismic_k2.vlm.dataset import ExportedMultimodalDataset
 
 
-FAULT_OVERLAY_SIZE = 32
-FAULT_OVERLAY_LOSS_WEIGHT = 0.25
-FAULT_PRESENCE_LOSS_WEIGHT = 0.10
-FAULT_POS_WEIGHT = 20.0
-FAULT_FOCAL_GAMMA = 2.0
-DEFAULT_MAX_IMAGE_SIDE = 512
-REAL_MASK_FIELDS = (
-    "fault_mask_path",
-    "mask_path",
-    "segmentation_mask_path",
-    "fault_label_path",
-    "yolo_label_path",
+IMAGE_PROMPT = "Represent this seismic slice for downstream geoscience question answering."
+SEG_TOKEN = "<SEG>"
+DEFAULT_MASK_OUTPUT_SIZE = 256
+DEFAULT_MASK_LOSS_WEIGHT = 1.0
+DEFAULT_MASK_DICE_WEIGHT = 1.0
+DEFAULT_WANDB_PROJECT = "k2-seismic-lisa"
+K2_PROMPT = (
+    "You are a seismic interpretation assistant. Use the visual prefix from the image "
+    "to answer concisely with geological reasoning.\nAnswer:"
 )
-
-
-def latest_checkpoint(output_dir):
-    output_dir = Path(output_dir)
-    if not output_dir.exists():
-        return None
-    checkpoint = get_last_checkpoint(output_dir.as_posix())
-    if checkpoint is None:
-        return None
-
-    checkpoint = Path(checkpoint)
-    loadable_files = (
-        "pytorch_model.bin",
-        "pytorch_model.bin.index.json",
-        "model.safetensors",
-        "model.safetensors.index.json",
-        "k2_qwen_vision_projector.pt",
-        "fault_overlay_head.pt",
-    )
-    if any((checkpoint / filename).exists() for filename in loadable_files):
-        return checkpoint.as_posix()
-
-    adapter_paths = (
-        checkpoint / "qwen_vision_adapter" / "adapter_model.safetensors",
-        checkpoint / "qwen_vision_adapter" / "adapter_model.bin",
-        checkpoint / "k2_lora_adapter" / "adapter_model.safetensors",
-        checkpoint / "k2_lora_adapter" / "adapter_model.bin",
-    )
-    if any(path.exists() for path in adapter_paths):
-        return checkpoint.as_posix()
-
-    print(f"ignoring checkpoint without loadable K2 vision files: {checkpoint}")
-    return None
-
-
-def has_k2_vision_checkpoint_parts(checkpoint_dir):
-    checkpoint_dir = Path(checkpoint_dir)
-    paths = (
-        checkpoint_dir / "k2_qwen_vision_projector.pt",
-        checkpoint_dir / "fault_overlay_head.pt",
-        checkpoint_dir / "qwen_vision_adapter" / "adapter_model.safetensors",
-        checkpoint_dir / "qwen_vision_adapter" / "adapter_model.bin",
-        checkpoint_dir / "k2_lora_adapter" / "adapter_model.safetensors",
-        checkpoint_dir / "k2_lora_adapter" / "adapter_model.bin",
-    )
-    return any(path.exists() for path in paths)
-
-
-def quarantine_trainer_state_for_retry(checkpoint_dir):
-    checkpoint_dir = Path(checkpoint_dir)
-    moved = []
-    for filename in ("optimizer.pt", "scheduler.pt", "scaler.pt", "rng_state.pth"):
-        path = checkpoint_dir / filename
-        if path.exists():
-            backup = checkpoint_dir / f"{filename}.incompatible"
-            if backup.exists():
-                backup.unlink()
-            shutil.move(path.as_posix(), backup.as_posix())
-            moved.append((path, backup))
-    return moved
-
-
-def restore_quarantined_trainer_state(moved):
-    for path, backup in moved:
-        if backup.exists() and not path.exists():
-            shutil.move(backup.as_posix(), path.as_posix())
+K2_VQA_PROMPT_TEMPLATE = (
+    "You are a seismic interpretation assistant. Use the visual prefix from the image "
+    "to answer the question.\nQuestion: {question}\nAnswer:"
+)
+DEFAULT_MAX_IMAGE_SIDE = 512
 
 
 def final_dir_for(output_dir):
@@ -133,8 +69,8 @@ def k2_lora_dir_for(output_dir):
     return final_dir_for(output_dir) / "k2_lora_adapter"
 
 
-def fault_overlay_head_path_for(output_dir):
-    return final_dir_for(output_dir) / "fault_overlay_head.pt"
+def segmentation_head_path_for(output_dir):
+    return final_dir_for(output_dir) / "segmentation_head.pt"
 
 
 def resolve_existing_path(*paths):
@@ -152,10 +88,7 @@ def has_peft_adapter(path):
     return (
         path.exists()
         and (path / "adapter_config.json").exists()
-        and (
-            (path / "adapter_model.safetensors").exists()
-            or (path / "adapter_model.bin").exists()
-        )
+        and ((path / "adapter_model.safetensors").exists() or (path / "adapter_model.bin").exists())
     )
 
 
@@ -187,7 +120,7 @@ def download_k2(model_dir=K2_MODEL_DIR):
         return model_dir
 
     model_dir.mkdir(parents=True, exist_ok=True)
-    print(f"downloading {K2_REPO_ID} to {model_dir}")
+    print(f"snapshot_download: {K2_REPO_ID} -> {model_dir}")
     snapshot_download(
         repo_id=K2_REPO_ID,
         local_dir=model_dir.as_posix(),
@@ -201,12 +134,7 @@ def has_tokenizer_files(path):
     path = Path(path)
     return any(
         (path / filename).exists()
-        for filename in (
-            "tokenizer.model",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-        )
+        for filename in ("tokenizer.model", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")
     )
 
 
@@ -214,24 +142,17 @@ def load_k2_tokenizer(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME):
     tokenizer = None
     if has_tokenizer_files(model_dir):
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                Path(model_dir).as_posix(),
-                use_fast=False,
-                trust_remote_code=True,
-            )
+            tokenizer = AutoTokenizer.from_pretrained(Path(model_dir).as_posix(), use_fast=False, trust_remote_code=True)
         except Exception:
             tokenizer = None
 
     if tokenizer is None or getattr(tokenizer, "vocab_size", 0) < 1000:
-        tokenizer = LlamaTokenizer.from_pretrained(
-            tokenizer_name,
-            use_fast=False,
-        )
+        tokenizer = LlamaTokenizer.from_pretrained(tokenizer_name, use_fast=False)
 
     if getattr(tokenizer, "vocab_size", 0) < 1000:
         raise ValueError(
             f"Invalid K2 tokenizer vocab_size={getattr(tokenizer, 'vocab_size', None)}. "
-            "K2 needs a LLaMA tokenizer, not the incomplete local tokenizer files."
+            "K2 needs a LLaMA tokenizer, not incomplete local tokenizer files."
         )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -243,23 +164,45 @@ def load_k2(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME, lora_adapt
     tokenizer = load_k2_tokenizer(model_dir, tokenizer_name)
     print(f"loaded K2 tokenizer vocab_size={tokenizer.vocab_size}")
 
+    quantization_config = None
+    if torch.cuda.is_available():
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16 if is_bfloat16_supported() else torch.float16,
+        )
+
     model = AutoModelForCausalLM.from_pretrained(
         model_dir.as_posix(),
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
+        device_map={"": 0} if torch.cuda.is_available() else None,
+        quantization_config=quantization_config,
         trust_remote_code=True,
     )
+    if is_trainable and quantization_config is not None:
+        model = prepare_model_for_kbit_training(model)
     if lora_adapter_dir is not None and has_peft_adapter(lora_adapter_dir):
-        model = PeftModel.from_pretrained(
-            model,
-            Path(lora_adapter_dir).as_posix(),
-            is_trainable=is_trainable,
-        )
+        model = PeftModel.from_pretrained(model, Path(lora_adapter_dir).as_posix(), is_trainable=is_trainable)
         print(f"loaded K2 LoRA adapter from {lora_adapter_dir}")
     elif lora_adapter_dir is not None:
         print(f"K2 LoRA adapter not found or incomplete at {lora_adapter_dir}; using base K2")
     model.eval()
     return model, tokenizer
+
+
+def ensure_seg_token(model, tokenizer):
+    token_id = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
+    if token_id is None or token_id == getattr(tokenizer, "unk_token_id", None):
+        tokenizer.add_special_tokens({"additional_special_tokens": [SEG_TOKEN]})
+        token_id = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
+        resize_target = model.get_base_model() if isinstance(model, PeftModel) else model
+        try:
+            resize_target.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+        except TypeError:
+            resize_target.resize_token_embeddings(len(tokenizer))
+        print(f"added {SEG_TOKEN} token with id={token_id}")
+    return token_id
 
 
 def add_k2_lora(model, r=8, alpha=16, dropout=0.05):
@@ -295,11 +238,7 @@ def load_qwen_vision_encoder(trainable=False, adapter_dir=None):
         adapter_dir = Path(adapter_dir)
     has_vision_adapter = adapter_dir is not None and has_peft_adapter(adapter_dir)
     if has_vision_adapter:
-        model = PeftModel.from_pretrained(
-            model,
-            adapter_dir.as_posix(),
-            is_trainable=trainable,
-        )
+        model = PeftModel.from_pretrained(model, adapter_dir.as_posix(), is_trainable=trainable)
         if trainable:
             print(f"loaded trainable Qwen vision adapter from {adapter_dir}")
         else:
@@ -353,7 +292,6 @@ def get_image_token_id(model, processor):
         token_id = tokenizer.convert_tokens_to_ids(token)
         if token_id is not None and token_id != getattr(tokenizer, "unk_token_id", None):
             return token_id
-
     raise ValueError("Could not infer Qwen image token id.")
 
 
@@ -367,8 +305,7 @@ def apply_image_token_dropout(image_mask, drop_rate=VISION_TOKEN_DROP_RATE, trai
 
     empty_rows = image_mask.any(dim=1) & ~keep_mask.any(dim=1)
     if empty_rows.any():
-        row_indices = empty_rows.nonzero(as_tuple=False).flatten()
-        for row in row_indices.tolist():
+        for row in empty_rows.nonzero(as_tuple=False).flatten().tolist():
             token_indices = image_mask[row].nonzero(as_tuple=False).flatten()
             selected = token_indices[torch.randint(token_indices.numel(), (1,), device=image_mask.device)]
             keep_mask[row, selected] = True
@@ -376,6 +313,9 @@ def apply_image_token_dropout(image_mask, drop_rate=VISION_TOKEN_DROP_RATE, trai
 
 
 class VisionPrefixProjector(nn.Module):
+    # Custom bridge: Qwen and K2 do not share a native multimodal interface.
+    # This MLP turns one pooled Qwen image embedding into a few fake K2 input
+    # embeddings that are prepended before the text prompt.
     def __init__(self, vision_hidden_size, k2_hidden_size, num_prefix_tokens=NUM_VISION_PREFIX_TOKENS):
         super().__init__()
         self.num_prefix_tokens = num_prefix_tokens
@@ -398,69 +338,8 @@ def load_or_create_projector(vision_hidden_size, k2_hidden_size, projector_path=
         projector.load_state_dict(state)
         print(f"loaded vision-prefix projector from {projector_path}")
     else:
-        print(
-            f"projector not found at {projector_path}; using randomly initialized projector. "
-            "Train this projector before expecting grounded K2 image understanding."
-        )
+        print(f"projector not found at {projector_path}; using randomly initialized projector")
     return projector
-
-
-def encode_image_with_qwen(qwen_model, qwen_processor, image, token_drop_rate=0.0):
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": IMAGE_PROMPT},
-            ],
-        }
-    ]
-    prompt = qwen_processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
-    inputs = qwen_processor(
-        text=[prompt],
-        images=[[image]],
-        return_tensors="pt",
-    )
-    device = next(qwen_model.parameters()).device
-    inputs = {
-        key: value.to(device) if hasattr(value, "to") else value
-        for key, value in inputs.items()
-    }
-    image_token_id = get_image_token_id(qwen_model, qwen_processor)
-
-    with torch.no_grad():
-        outputs = qwen_forward_hidden_states(qwen_model, inputs)
-
-    hidden_states = outputs.hidden_states[-1]
-    image_mask = inputs["input_ids"].eq(image_token_id)
-    image_mask = apply_image_token_dropout(
-        image_mask,
-        drop_rate=token_drop_rate,
-        training=token_drop_rate > 0,
-    )
-    mask = image_mask.to(hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
-    return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-
-
-def encode_qwen_inputs(qwen_model, qwen_processor, inputs, token_drop_rate=VISION_TOKEN_DROP_RATE, return_tokens=False):
-    image_token_id = get_image_token_id(qwen_model, qwen_processor)
-    outputs = qwen_forward_hidden_states(qwen_model, inputs)
-    hidden_states = outputs.hidden_states[-1]
-    image_mask = inputs["input_ids"].eq(image_token_id)
-    image_mask = apply_image_token_dropout(
-        image_mask,
-        drop_rate=token_drop_rate,
-        training=qwen_model.training,
-    )
-    mask = image_mask.to(hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
-    vision_latent = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-    if not return_tokens:
-        return vision_latent
-    return vision_latent, hidden_states, image_mask
 
 
 def qwen_forward_hidden_states(qwen_model, inputs):
@@ -469,9 +348,6 @@ def qwen_forward_hidden_states(qwen_model, inputs):
         "output_hidden_states": True,
         "return_dict": True,
         "use_cache": False,
-        # Qwen-VL otherwise computes full vocabulary logits even though this
-        # path only needs hidden states. Keeping one logit position avoids a
-        # multi-GB lm_head allocation on 24GB GPUs.
         "logits_to_keep": 1,
     }
     try:
@@ -481,7 +357,30 @@ def qwen_forward_hidden_states(qwen_model, inputs):
         return qwen_model(**kwargs)
 
 
-def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt):
+def encode_qwen_inputs(qwen_model, qwen_processor, inputs, token_drop_rate=VISION_TOKEN_DROP_RATE, return_tokens=False):
+    image_token_id = get_image_token_id(qwen_model, qwen_processor)
+    outputs = qwen_forward_hidden_states(qwen_model, inputs)
+    hidden_states = outputs.hidden_states[-1]
+    image_mask = inputs["input_ids"].eq(image_token_id)
+    image_mask = apply_image_token_dropout(image_mask, drop_rate=token_drop_rate, training=qwen_model.training)
+    mask = image_mask.to(hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
+    vision_latent = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+    if return_tokens:
+        return vision_latent, hidden_states, image_mask
+    return vision_latent
+
+
+def encode_image_with_qwen(qwen_model, qwen_processor, image, token_drop_rate=0.0, return_tokens=False):
+    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": IMAGE_PROMPT}]}]
+    prompt = qwen_processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    inputs = qwen_processor(text=[prompt], images=[[image]], return_tensors="pt")
+    device = next(qwen_model.parameters()).device
+    inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
+    with torch.no_grad():
+        return encode_qwen_inputs(qwen_model, qwen_processor, inputs, token_drop_rate=token_drop_rate, return_tokens=return_tokens)
+
+
+def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt, max_new_tokens=128):
     device = k2_model.get_input_embeddings().weight.device
     text_inputs = k2_tokenizer(prompt, return_tensors="pt")
     text_inputs = {key: value.to(device) for key, value in text_inputs.items()}
@@ -489,17 +388,13 @@ def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt):
     text_embeddings = k2_model.get_input_embeddings()(text_inputs["input_ids"])
     visual_prefix = visual_prefix.to(device=device, dtype=text_embeddings.dtype)
     inputs_embeds = torch.cat([visual_prefix, text_embeddings], dim=1)
-    prefix_mask = torch.ones(
-        visual_prefix.size()[:2],
-        dtype=text_inputs["attention_mask"].dtype,
-        device=device,
-    )
+    prefix_mask = torch.ones(visual_prefix.size()[:2], dtype=text_inputs["attention_mask"].dtype, device=device)
     attention_mask = torch.cat([prefix_mask, text_inputs["attention_mask"]], dim=1)
 
     generation_kwargs = {
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
-        "max_new_tokens": 128,
+        "max_new_tokens": max_new_tokens,
         "min_new_tokens": 8,
         "do_sample": False,
         "repetition_penalty": 1.15,
@@ -512,310 +407,42 @@ def generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt):
     with torch.no_grad():
         generated_ids = k2_model.generate(**generation_kwargs)
     token_ids = generated_ids[0].detach().cpu().tolist()
-    token_variants = [token_ids]
-    if len(token_ids) > 1:
-        token_variants.append(token_ids[1:])
-    special_ids = {
-        token_id
-        for token_id in (
-            getattr(k2_tokenizer, "bos_token_id", None),
-            getattr(k2_tokenizer, "eos_token_id", None),
-            getattr(k2_tokenizer, "pad_token_id", None),
-            getattr(k2_tokenizer, "unk_token_id", None),
-        )
-        if token_id is not None
-    }
-    filtered_ids = [token_id for token_id in token_ids if token_id not in special_ids]
-    if filtered_ids and filtered_ids != token_ids:
-        token_variants.append(filtered_ids)
-
-    decode_candidates = [
-        k2_tokenizer.decode(ids, skip_special_tokens=skip_special).strip()
-        for ids in token_variants
-        for skip_special in (True, False)
-    ]
-    sp_model = getattr(k2_tokenizer, "sp_model", None)
-    if sp_model is not None:
-        for ids in token_variants:
-            try:
-                decode_candidates.append(sp_model.DecodeIds([int(token_id) for token_id in ids]).strip())
-            except Exception:
-                pass
-
-    text = ""
-    for candidate in decode_candidates:
-        candidate = candidate.strip()
-        if not candidate or candidate == getattr(k2_tokenizer, "unk_token", "<unk>"):
-            continue
-        if candidate.startswith(getattr(k2_tokenizer, "unk_token", "<unk>")):
-            candidate = candidate[len(getattr(k2_tokenizer, "unk_token", "<unk>")) :].strip()
-        if not candidate:
-            continue
-        text = candidate
-        break
+    text = k2_tokenizer.decode(token_ids, skip_special_tokens=True).strip()
     if "Answer:" in text:
         text = text.rsplit("Answer:", 1)[-1].strip()
-    if text:
-        return text
+    return text or f"[empty decoded output] token_ids={token_ids[:64]}"
 
-    raw_text = decode_candidates[-1] if decode_candidates else ""
-    token_preview = token_ids[:64]
-    return f"[empty decoded output] raw={raw_text!r} token_ids={token_preview}"
+
+def get_k2_hidden_for_seg_token(k2_model, k2_tokenizer, visual_prefix, prompt, answer, seg_token_id):
+    device = k2_model.get_input_embeddings().weight.device
+    text = f"{prompt}{answer}\n{SEG_TOKEN}"
+    text_inputs = k2_tokenizer(text, return_tensors="pt", add_special_tokens=True)
+    text_inputs = {key: value.to(device) for key, value in text_inputs.items()}
+    input_ids = text_inputs["input_ids"]
+    seg_positions = input_ids.eq(seg_token_id).nonzero(as_tuple=False)
+    if seg_positions.numel() == 0:
+        raise ValueError(f"{SEG_TOKEN} was not found in forced segmentation prompt.")
+
+    text_embeddings = k2_model.get_input_embeddings()(input_ids)
+    visual_prefix = visual_prefix.to(device=device, dtype=text_embeddings.dtype)
+    inputs_embeds = torch.cat([visual_prefix, text_embeddings], dim=1)
+    prefix_mask = torch.ones(visual_prefix.size()[:2], dtype=text_inputs["attention_mask"].dtype, device=device)
+    attention_mask = torch.cat([prefix_mask, text_inputs["attention_mask"]], dim=1)
+
+    with torch.no_grad():
+        outputs = k2_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+    seg_position = int(seg_positions[-1, 1].item()) + visual_prefix.size(1)
+    return outputs.hidden_states[-1][:, seg_position]
 
 
 def build_k2_vqa_prompt(question):
     return K2_VQA_PROMPT_TEMPLATE.format(question=question)
-
-
-def get_message_text(messages):
-    if not messages:
-        return ""
-    for message in messages:
-        if message.get("role") != "assistant":
-            continue
-        content = message.get("content", [])
-        if isinstance(content, str):
-            return content
-        for item in content:
-            if item.get("type") == "text":
-                return item.get("text", "")
-    return ""
-
-
-def get_question(record):
-    if record.get("question"):
-        return record["question"]
-    messages = record.get("messages", [])
-    for message in messages:
-        if message.get("role") != "user":
-            continue
-        content = message.get("content", [])
-        if isinstance(content, str):
-            return content
-        texts = [item.get("text", "") for item in content if item.get("type") == "text"]
-        return "\n".join(texts).strip()
-    return K2_PROMPT
-
-
-def resize_image_for_training(image, max_side=DEFAULT_MAX_IMAGE_SIDE):
-    if max_side is None or max_side <= 0:
-        return image
-    width, height = image.size
-    longest = max(width, height)
-    if longest <= max_side:
-        return image
-    scale = max_side / float(longest)
-    new_size = (max(int(round(width * scale)), 1), max(int(round(height * scale)), 1))
-    return image.resize(new_size, Image.Resampling.BICUBIC)
-
-
-def resolve_record_path(record, value):
-    path = Path(value)
-    if path.exists():
-        return path
-    image_value = record.get("image")
-    if image_value:
-        image_parent = Path(image_value).parent
-        candidate = image_parent / path
-        if candidate.exists():
-            return candidate
-    return path
-
-
-def find_yolo_label_for_image(image_path):
-    image_path = Path(image_path)
-    parts = list(image_path.parts)
-    if "images" not in parts:
-        return None
-    index = len(parts) - 1 - parts[::-1].index("images")
-    parts[index] = "labels"
-    label_path = Path(*parts).with_suffix(".txt")
-    return label_path if label_path.exists() else None
-
-
-def real_fault_label_path(record):
-    for field in REAL_MASK_FIELDS:
-        value = record.get(field)
-        if value:
-            path = resolve_record_path(record, value)
-            if path.exists():
-                return path
-    image_path = record.get("image")
-    if image_path:
-        return find_yolo_label_for_image(image_path)
-    return None
-
-
-def rasterize_fault_target(record, image_size, output_size=FAULT_OVERLAY_SIZE, allow_pseudo_labels=False):
-    label_path = real_fault_label_path(record)
-    if label_path is not None:
-        suffix = label_path.suffix.lower()
-        if suffix == ".txt":
-            mask = rasterize_yolo_label(label_path, output_size=output_size)
-        else:
-            mask = load_fault_mask(label_path, output_size=output_size)
-        return mask, torch.tensor([float(mask.max().item() > 0.5)], dtype=torch.float32), torch.tensor([1.0]), "real"
-
-    if allow_pseudo_labels:
-        detections = record.get("faultnet_detections") or []
-        mask = rasterize_fault_overlay(detections, image_size, output_size=output_size)
-        return mask, torch.tensor([1.0 if detections else 0.0], dtype=torch.float32), torch.tensor([1.0]), "pseudo"
-
-    mask = torch.zeros((1, output_size, output_size), dtype=torch.float32)
-    return mask, torch.zeros(1, dtype=torch.float32), torch.zeros(1, dtype=torch.float32), "missing"
-
-
-def load_fault_mask(path, output_size=FAULT_OVERLAY_SIZE):
-    path = Path(path)
-    if path.suffix.lower() in {".npy", ".npz"}:
-        array = np.load(path)
-        if isinstance(array, np.lib.npyio.NpzFile):
-            key = "fault" if "fault" in array.files else array.files[0]
-            array = array[key]
-        if array.ndim == 3:
-            array = array[array.shape[0] // 2]
-        image = Image.fromarray((array.astype(np.float32) > 0).astype(np.uint8) * 255, mode="L")
-    else:
-        image = Image.open(path).convert("L")
-    image = image.resize((output_size, output_size), Image.Resampling.NEAREST)
-    mask = (np.asarray(image) > 0).astype(np.float32)
-    return torch.from_numpy(mask).unsqueeze(0)
-
-
-def rasterize_yolo_label(path, output_size=FAULT_OVERLAY_SIZE):
-    mask = torch.zeros((1, output_size, output_size), dtype=torch.float32)
-    text = Path(path).read_text(encoding="utf-8").strip()
-    if not text:
-        return mask
-    for line in text.splitlines():
-        values = line.split()
-        if len(values) < 7:
-            continue
-        coords = [float(value) for value in values[1:]]
-        points = []
-        for x, y in zip(coords[0::2], coords[1::2]):
-            px = int(round(x * (output_size - 1)))
-            py = int(round(y * (output_size - 1)))
-            points.append((min(max(px, 0), output_size - 1), min(max(py, 0), output_size - 1)))
-        if len(points) >= 3:
-            fill_polygon(mask[0], points)
-    return mask
-
-
-def rasterize_fault_overlay(detections, image_size, output_size=FAULT_OVERLAY_SIZE):
-    mask = torch.zeros((1, output_size, output_size), dtype=torch.float32)
-    width, height = image_size
-    if width <= 0 or height <= 0:
-        return mask
-
-    for detection in detections or []:
-        polygon = detection.get("polygon_xy_sample") or []
-        if len(polygon) >= 3:
-            points = []
-            for x, y in polygon:
-                px = int(round(float(x) / width * (output_size - 1)))
-                py = int(round(float(y) / height * (output_size - 1)))
-                points.append((min(max(px, 0), output_size - 1), min(max(py, 0), output_size - 1)))
-            fill_polygon(mask[0], points)
-            continue
-
-        box = detection.get("box_xyxy")
-        if not box or len(box) != 4:
-            continue
-        x1, y1, x2, y2 = [float(value) for value in box]
-        x1 = int(round(x1 / width * (output_size - 1)))
-        x2 = int(round(x2 / width * (output_size - 1)))
-        y1 = int(round(y1 / height * (output_size - 1)))
-        y2 = int(round(y2 / height * (output_size - 1)))
-        x1, x2 = sorted((min(max(x1, 0), output_size - 1), min(max(x2, 0), output_size - 1)))
-        y1, y2 = sorted((min(max(y1, 0), output_size - 1), min(max(y2, 0), output_size - 1)))
-        mask[:, y1 : y2 + 1, x1 : x2 + 1] = 1.0
-    return mask
-
-
-def fill_polygon(mask, points):
-    xs = [point[0] for point in points]
-    ys = [point[1] for point in points]
-    min_x, max_x = max(min(xs), 0), min(max(xs), mask.shape[1] - 1)
-    min_y, max_y = max(min(ys), 0), min(max(ys), mask.shape[0] - 1)
-    for y in range(min_y, max_y + 1):
-        for x in range(min_x, max_x + 1):
-            if point_in_polygon(x + 0.5, y + 0.5, points):
-                mask[y, x] = 1.0
-
-
-def point_in_polygon(x, y, points):
-    inside = False
-    j = len(points) - 1
-    for i, (xi, yi) in enumerate(points):
-        xj, yj = points[j]
-        intersects = (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-6) + xi
-        if intersects:
-            inside = not inside
-        j = i
-    return inside
-
-
-class K2VisionDataset(Dataset):
-    def __init__(
-        self,
-        jsonl_path,
-        allow_pseudo_fault_labels=False,
-        max_image_side=DEFAULT_MAX_IMAGE_SIDE,
-        fault_output_size=FAULT_OVERLAY_SIZE,
-    ):
-        jsonl_path = Path(jsonl_path)
-        if not jsonl_path.exists():
-            raise FileNotFoundError(f"Generated SFT JSONL not found: {jsonl_path}")
-        self.allow_pseudo_fault_labels = allow_pseudo_fault_labels
-        self.max_image_side = max_image_side
-        self.fault_output_size = fault_output_size
-        self.records = []
-        with jsonl_path.open("r", encoding="utf-8") as file:
-            for line in file:
-                if line.strip():
-                    self.records.append(json.loads(line))
-        if not self.records:
-            raise ValueError(f"No records found in {jsonl_path}")
-        self.fault_label_source_counts = self.count_fault_label_sources()
-
-    def count_fault_label_sources(self):
-        counts = {"real": 0, "pseudo": 0, "missing": 0}
-        for record in self.records:
-            if real_fault_label_path(record) is not None:
-                counts["real"] += 1
-            elif self.allow_pseudo_fault_labels and "faultnet_detections" in record:
-                counts["pseudo"] += 1
-            else:
-                counts["missing"] += 1
-        return counts
-
-    def __len__(self):
-        return len(self.records)
-
-    def __getitem__(self, index):
-        record = self.records[index]
-        image_path = Path(record["image"])
-        image = Image.open(image_path).convert("RGB")
-        original_size = image.size
-        image = resize_image_for_training(image, self.max_image_side)
-        answer = get_message_text(record.get("messages", [])) or record.get("chosen_answer", "")
-        question = get_question(record)
-        fault_overlay, fault_presence, fault_valid, fault_source = rasterize_fault_target(
-            record,
-            original_size,
-            output_size=self.fault_output_size,
-            allow_pseudo_labels=self.allow_pseudo_fault_labels,
-        )
-        return {
-            "image": image,
-            "question": question,
-            "answer": answer,
-            "fault_overlay": fault_overlay,
-            "fault_presence": fault_presence,
-            "fault_overlay_valid": fault_valid,
-            "fault_label_source": fault_source,
-        }
 
 
 class K2VisionCollator:
@@ -823,26 +450,15 @@ class K2VisionCollator:
         self.qwen_processor = qwen_processor
         self.k2_tokenizer = k2_tokenizer
         self.max_length = max_length
+        self.seg_token_id = self.k2_tokenizer.convert_tokens_to_ids(SEG_TOKEN)
 
     def __call__(self, examples):
         qwen_messages = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": IMAGE_PROMPT},
-                    ],
-                }
-            ]
+            [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": IMAGE_PROMPT}]}]
             for _ in examples
         ]
         qwen_prompts = [
-            self.qwen_processor.apply_chat_template(
-                message,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
+            self.qwen_processor.apply_chat_template(message, add_generation_prompt=True, tokenize=False)
             for message in qwen_messages
         ]
         qwen_inputs = self.qwen_processor(
@@ -852,39 +468,31 @@ class K2VisionCollator:
             padding=True,
         )
 
-        prompt_texts = [
-            build_k2_vqa_prompt(example["question"])
-            for example in examples
-        ]
         input_id_rows = []
         label_rows = []
         attention_rows = []
-        pad_token_id = self.k2_tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = self.k2_tokenizer.eos_token_id
+        pad_token_id = self.k2_tokenizer.pad_token_id or self.k2_tokenizer.eos_token_id
 
-        for prompt_text, example in zip(prompt_texts, examples):
+        for example in examples:
             prompt_ids = self.k2_tokenizer(
-                prompt_text,
+                build_k2_vqa_prompt(example["question"]),
                 add_special_tokens=True,
                 truncation=False,
             )["input_ids"]
-            answer_ids = self.k2_tokenizer(
-                f"\n{example['answer']}",
-                add_special_tokens=False,
-                truncation=False,
-            )["input_ids"]
+            answer_text = f"\n{example['answer']}"
+            if example.get("mask_valid") is not None and float(example["mask_valid"].item()) > 0.5:
+                answer_text = f"{answer_text}\n{SEG_TOKEN}"
+            answer_ids = self.k2_tokenizer(answer_text, add_special_tokens=False, truncation=False)[
+                "input_ids"
+            ]
             if not answer_ids:
-                raise ValueError("Empty answer text produced no K2 target tokens.")
+                raise ValueError(f"empty answer target for record {example.get('id')}")
 
             if len(answer_ids) >= self.max_length:
                 answer_ids = answer_ids[: self.max_length - 1]
             max_prompt_len = self.max_length - len(answer_ids)
             if max_prompt_len <= 0:
-                raise ValueError(
-                    "No room left for prompt tokens. Increase K2VisionCollator max_length "
-                    "or shorten generated answers."
-                )
+                raise ValueError("no room left for prompt tokens; increase the K2 text length limit")
             prompt_ids = prompt_ids[-max_prompt_len:]
             input_ids = prompt_ids + answer_ids
             labels = [-100] * len(prompt_ids) + answer_ids
@@ -900,47 +508,47 @@ class K2VisionCollator:
             labels.extend([-100] * pad_len)
             attention_mask.extend([0] * pad_len)
 
-        k2_input_ids = torch.tensor(input_id_rows, dtype=torch.long)
-        labels = torch.tensor(label_rows, dtype=torch.long)
-        k2_attention_mask = torch.tensor(attention_rows, dtype=torch.long)
-        if labels.ne(-100).sum().item() == 0:
-            raise ValueError(
-                "No answer tokens left for loss after masking. "
-                "Increase K2VisionCollator max_length or shorten the prompt/answers."
-            )
-
         batch = {f"qwen_{key}": value for key, value in qwen_inputs.items()}
-        batch["k2_input_ids"] = k2_input_ids
-        batch["k2_attention_mask"] = k2_attention_mask
-        batch["labels"] = labels
-        batch["fault_overlay"] = torch.stack([example["fault_overlay"] for example in examples])
-        batch["fault_presence"] = torch.stack([example["fault_presence"] for example in examples])
-        batch["fault_overlay_valid"] = torch.stack([example["fault_overlay_valid"] for example in examples])
+        batch["k2_input_ids"] = torch.tensor(input_id_rows, dtype=torch.long)
+        batch["k2_attention_mask"] = torch.tensor(attention_rows, dtype=torch.long)
+        batch["labels"] = torch.tensor(label_rows, dtype=torch.long)
+        batch["target_masks"] = torch.stack([example["mask"] for example in examples])
+        batch["mask_valid"] = torch.stack([example["mask_valid"] for example in examples])
         return batch
 
 
-class FaultOverlayHead(nn.Module):
-    def __init__(self, vision_hidden_size, output_size=FAULT_OVERLAY_SIZE):
+class LisaStyleSegmentationHead(nn.Module):
+    # Custom LISA-style head: when masks exist, the hidden state at <SEG>
+    # becomes a query that scores Qwen image tokens and produces a mask.
+    def __init__(self, vision_hidden_size, k2_hidden_size, output_size=DEFAULT_MASK_OUTPUT_SIZE):
         super().__init__()
         self.output_size = output_size
-        hidden = max(vision_hidden_size // 4, 64)
-        self.token_score = nn.Sequential(
-            nn.LayerNorm(vision_hidden_size),
-            nn.Linear(vision_hidden_size, hidden),
+        hidden = max(vision_hidden_size // 2, 128)
+        self.seg_projector = nn.Sequential(
+            nn.LayerNorm(k2_hidden_size),
+            nn.Linear(k2_hidden_size, vision_hidden_size),
             nn.GELU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(vision_hidden_size, vision_hidden_size),
         )
-        self.presence_head = nn.Sequential(
+        self.token_projector = nn.Sequential(
             nn.LayerNorm(vision_hidden_size),
             nn.Linear(vision_hidden_size, hidden),
             nn.GELU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, vision_hidden_size),
+        )
+        self.bias = nn.Sequential(
+            nn.LayerNorm(vision_hidden_size),
+            nn.Linear(vision_hidden_size, 1),
         )
 
-    def forward(self, vision_tokens, image_mask, vision_latent):
+    def forward(self, vision_tokens, image_mask, seg_hidden):
+        query = self.seg_projector(seg_hidden)
+        tokens = self.token_projector(vision_tokens)
+        scores = (tokens * query.unsqueeze(1)).sum(dim=-1) / max(query.size(-1) ** 0.5, 1.0)
+        scores = scores + self.bias(vision_tokens).squeeze(-1)
+        scores = scores.masked_fill(~image_mask, 0.0)
+
         batch_size = vision_tokens.size(0)
-        token_scores = self.token_score(vision_tokens).squeeze(-1)
-        token_scores = token_scores.masked_fill(~image_mask, 0.0)
         token_counts = image_mask.sum(dim=1).clamp_min(1)
         max_tokens = int(token_counts.max().item())
         side = max(int(max_tokens**0.5), 1)
@@ -949,89 +557,67 @@ class FaultOverlayHead(nn.Module):
 
         grid = vision_tokens.new_zeros((batch_size, 1, side * side))
         for row in range(batch_size):
-            values = token_scores[row, image_mask[row]]
+            values = scores[row, image_mask[row]]
             grid[row, 0, : values.numel()] = values
         grid = grid.view(batch_size, 1, side, side)
-        overlay_logits = F.interpolate(
-            grid,
-            size=(self.output_size, self.output_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        presence_logits = self.presence_head(vision_latent)
-        return {
-            "fault_overlay_logits": overlay_logits,
-            "fault_presence_logits": presence_logits,
-        }
+        return F.interpolate(grid, size=(self.output_size, self.output_size), mode="bilinear", align_corners=False)
 
 
-def load_or_create_fault_overlay_head(vision_hidden_size, head_path=None, output_size=FAULT_OVERLAY_SIZE):
-    head = FaultOverlayHead(vision_hidden_size, output_size=output_size)
+def load_or_create_segmentation_head(vision_hidden_size, k2_hidden_size, head_path=None, output_size=DEFAULT_MASK_OUTPUT_SIZE):
+    head = LisaStyleSegmentationHead(vision_hidden_size, k2_hidden_size, output_size=output_size)
     if head_path is not None and Path(head_path).exists():
         state = torch.load(head_path, map_location="cpu")
         head.load_state_dict(state)
-        print(f"loaded fault overlay head from {head_path}")
+        print(f"loaded segmentation head from {head_path}")
     elif head_path is not None:
-        print(f"fault overlay head not found at {head_path}; using randomly initialized head")
+        print(f"segmentation head not found at {head_path}; using randomly initialized head")
     return head
 
 
-def load_fault_overlay_head_compatible(vision_hidden_size, head_path=None, output_size=FAULT_OVERLAY_SIZE):
-    head = FaultOverlayHead(vision_hidden_size, output_size=output_size)
-    if head_path is None or not Path(head_path).exists():
-        if head_path is not None:
-            print(f"fault overlay head not found at {head_path}; using randomly initialized head")
-        return head
-    state = torch.load(head_path, map_location="cpu")
-    try:
-        head.load_state_dict(state)
-        print(f"loaded fault overlay head from {head_path}")
-    except RuntimeError as error:
-        print(
-            f"fault overlay head at {head_path} is incompatible with output_size={output_size}; "
-            f"using randomly initialized head. Details: {error}"
-        )
-    return head
+def dice_loss_from_logits(logits, target):
+    prob = torch.sigmoid(logits)
+    intersection = (prob * target).sum(dim=(1, 2, 3))
+    denominator = prob.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+    return (1 - (2 * intersection + 1e-6) / (denominator + 1e-6)).mean()
 
 
-class FrozenK2VisionModel(nn.Module):
+class K2VisionModel(nn.Module):
     def __init__(
         self,
         qwen_model,
         qwen_processor,
         k2_model,
         projector,
-        fault_overlay_head=None,
+        segmentation_head=None,
+        seg_token_id=None,
         vision_token_drop_rate=VISION_TOKEN_DROP_RATE,
-        fault_overlay_loss_weight=FAULT_OVERLAY_LOSS_WEIGHT,
-        fault_presence_loss_weight=FAULT_PRESENCE_LOSS_WEIGHT,
-        fault_pos_weight=FAULT_POS_WEIGHT,
-        fault_focal_gamma=FAULT_FOCAL_GAMMA,
+        mask_loss_weight=DEFAULT_MASK_LOSS_WEIGHT,
+        mask_dice_weight=DEFAULT_MASK_DICE_WEIGHT,
     ):
         super().__init__()
         self.qwen_model = qwen_model
         self.qwen_processor = qwen_processor
         self.k2_model = k2_model
         self.projector = projector
-        self.fault_overlay_head = fault_overlay_head
+        self.segmentation_head = segmentation_head
+        self.seg_token_id = seg_token_id
         self.vision_token_drop_rate = vision_token_drop_rate
-        self.fault_overlay_loss_weight = fault_overlay_loss_weight
-        self.fault_presence_loss_weight = fault_presence_loss_weight
-        self.fault_pos_weight = fault_pos_weight
-        self.fault_focal_gamma = fault_focal_gamma
+        self.mask_loss_weight = mask_loss_weight
+        self.mask_dice_weight = mask_dice_weight
         self.qwen_trainable = any(param.requires_grad for param in self.qwen_model.parameters())
         if not self.qwen_trainable:
             self.qwen_model.eval()
-
-        self.k2_model.eval()
+        self.k2_trainable = any(param.requires_grad for param in self.k2_model.parameters())
+        self.k2_model.train(self.k2_trainable)
         for name, param in self.k2_model.named_parameters():
             param.requires_grad = param.requires_grad and "lora_" in name
+        self.k2_trainable = any(param.requires_grad for param in self.k2_model.parameters())
 
     def train(self, mode: bool = True):
         super().train(mode)
         if not self.qwen_trainable:
             self.qwen_model.eval()
-        self.k2_model.eval()
+        self.k2_model.train(mode and self.k2_trainable)
         return self
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
@@ -1039,9 +625,7 @@ class FrozenK2VisionModel(nn.Module):
             if gradient_checkpointing_kwargs is None:
                 self.qwen_model.gradient_checkpointing_enable()
             else:
-                self.qwen_model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
-                )
+                self.qwen_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
 
     def gradient_checkpointing_disable(self):
         if hasattr(self.qwen_model, "gradient_checkpointing_disable"):
@@ -1061,32 +645,8 @@ class FrozenK2VisionModel(nn.Module):
         if isinstance(self.k2_model, PeftModel):
             self.k2_model.save_pretrained(output_dir / "k2_lora_adapter")
         torch.save(self.projector.state_dict(), output_dir / "k2_qwen_vision_projector.pt")
-        if self.fault_overlay_head is not None:
-            torch.save(self.fault_overlay_head.state_dict(), output_dir / "fault_overlay_head.pt")
-
-    def save_checkpoint_parts(self, output_dir):
-        self.save_pretrained(output_dir)
-
-    def load_checkpoint_parts(self, checkpoint_dir):
-        checkpoint_dir = Path(checkpoint_dir)
-        qwen_adapter_dir = checkpoint_dir / "qwen_vision_adapter"
-        if isinstance(self.qwen_model, PeftModel) and qwen_adapter_dir.exists():
-            state = load_peft_weights(qwen_adapter_dir.as_posix())
-            set_peft_model_state_dict(self.qwen_model, state)
-            print(f"resumed Qwen vision adapter from {qwen_adapter_dir}")
-        k2_lora_dir = checkpoint_dir / "k2_lora_adapter"
-        if isinstance(self.k2_model, PeftModel) and k2_lora_dir.exists():
-            state = load_peft_weights(k2_lora_dir.as_posix())
-            set_peft_model_state_dict(self.k2_model, state)
-            print(f"resumed K2 LoRA adapter from {k2_lora_dir}")
-        projector_path = checkpoint_dir / "k2_qwen_vision_projector.pt"
-        if projector_path.exists():
-            self.projector.load_state_dict(torch.load(projector_path, map_location="cpu"))
-            print(f"resumed projector from {projector_path}")
-        fault_head_path = checkpoint_dir / "fault_overlay_head.pt"
-        if self.fault_overlay_head is not None and fault_head_path.exists():
-            self.fault_overlay_head.load_state_dict(torch.load(fault_head_path, map_location="cpu"))
-            print(f"resumed fault overlay head from {fault_head_path}")
+        if self.segmentation_head is not None:
+            torch.save(self.segmentation_head.state_dict(), output_dir / "segmentation_head.pt")
 
     def forward(self, **batch):
         qwen_inputs = {
@@ -1111,21 +671,11 @@ class FrozenK2VisionModel(nn.Module):
                     token_drop_rate=self.vision_token_drop_rate,
                     return_tokens=True,
                 )
-        fault_outputs = {}
-        if self.fault_overlay_head is not None:
-            head_device = next(self.fault_overlay_head.parameters()).device
-            head_dtype = next(self.fault_overlay_head.parameters()).dtype
-            fault_outputs = self.fault_overlay_head(
-                vision_tokens.to(device=head_device, dtype=head_dtype),
-                image_mask.to(head_device),
-                vision_latent.to(device=head_device, dtype=head_dtype),
-            )
 
+        # Custom vision-to-language step: project Qwen's pooled image feature
+        # into K2 embedding space and prepend it to the text embeddings.
         projector_device = next(self.projector.parameters()).device
-        vision_latent = vision_latent.to(
-            device=projector_device,
-            dtype=next(self.projector.parameters()).dtype,
-        )
+        vision_latent = vision_latent.to(device=projector_device, dtype=next(self.projector.parameters()).dtype)
         visual_prefix = self.projector(vision_latent)
 
         k2_device = self.k2_model.get_input_embeddings().weight.device
@@ -1135,18 +685,9 @@ class FrozenK2VisionModel(nn.Module):
         text_embeddings = self.k2_model.get_input_embeddings()(input_ids)
         visual_prefix = visual_prefix.to(device=k2_device, dtype=text_embeddings.dtype)
         inputs_embeds = torch.cat([visual_prefix, text_embeddings], dim=1)
-        prefix_mask = torch.ones(
-            visual_prefix.size()[:2],
-            dtype=attention_mask.dtype,
-            device=k2_device,
-        )
+        prefix_mask = torch.ones(visual_prefix.size()[:2], dtype=attention_mask.dtype, device=k2_device)
         attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
-        prefix_labels = torch.full(
-            visual_prefix.size()[:2],
-            -100,
-            dtype=labels.dtype,
-            device=k2_device,
-        )
+        prefix_labels = torch.full(visual_prefix.size()[:2], -100, dtype=labels.dtype, device=k2_device)
         labels = torch.cat([prefix_labels, labels], dim=1)
 
         outputs = self.k2_model(
@@ -1154,138 +695,46 @@ class FrozenK2VisionModel(nn.Module):
             attention_mask=attention_mask,
             labels=labels,
             return_dict=True,
+            output_hidden_states=self.segmentation_head is not None,
         )
-        if self.fault_overlay_head is not None and "fault_overlay" in batch:
-            target_overlay = batch["fault_overlay"].to(
-                device=fault_outputs["fault_overlay_logits"].device,
-                dtype=fault_outputs["fault_overlay_logits"].dtype,
-            )
-            target_presence = batch["fault_presence"].to(
-                device=fault_outputs["fault_presence_logits"].device,
-                dtype=fault_outputs["fault_presence_logits"].dtype,
-            )
-            target_valid = batch["fault_overlay_valid"].to(
-                device=fault_outputs["fault_presence_logits"].device,
-                dtype=fault_outputs["fault_presence_logits"].dtype,
-            ).flatten()
-            valid_indices = target_valid > 0.5
-            if valid_indices.any():
-                overlay_logits = fault_outputs["fault_overlay_logits"][valid_indices]
-                presence_logits = fault_outputs["fault_presence_logits"][valid_indices]
-                overlay_loss = weighted_focal_bce_with_logits(
-                    overlay_logits,
-                    target_overlay[valid_indices],
-                    pos_weight=self.fault_pos_weight,
-                    gamma=self.fault_focal_gamma,
-                )
-                dice = dice_loss_from_logits(overlay_logits, target_overlay[valid_indices])
-                presence_loss = F.binary_cross_entropy_with_logits(
-                    presence_logits,
-                    target_presence[valid_indices],
-                )
-                outputs.loss = (
-                    outputs.loss
-                    + self.fault_overlay_loss_weight * (overlay_loss + dice)
-                    + self.fault_presence_loss_weight * presence_loss
-                )
-                outputs.fault_overlay_loss = overlay_loss.detach()
-                outputs.fault_overlay_dice_loss = dice.detach()
-                outputs.fault_presence_loss = presence_loss.detach()
-            outputs.fault_overlay_supervised = target_valid.sum().detach()
-        for key, value in fault_outputs.items():
-            setattr(outputs, key, value)
+        if self.segmentation_head is None or self.seg_token_id is None or "target_masks" not in batch:
+            return outputs
+
+        seg_mask = input_ids.eq(self.seg_token_id)
+        valid = batch["mask_valid"].to(k2_device).flatten() > 0.5
+        seg_valid = seg_mask.any(dim=1) & valid
+        if not seg_valid.any():
+            return outputs
+
+        # Custom mask step: pull the K2 hidden state at <SEG>, combine it with
+        # Qwen image-token features, and add BCE + Dice mask loss.
+        prefix_len = visual_prefix.size(1)
+        hidden_states = outputs.hidden_states[-1]
+        seg_positions = []
+        for row in range(input_ids.size(0)):
+            positions = seg_mask[row].nonzero(as_tuple=False).flatten()
+            seg_positions.append(int(positions[-1].item()) if positions.numel() else 0)
+        seg_positions = torch.tensor(seg_positions, dtype=torch.long, device=k2_device) + prefix_len
+        row_indices = torch.arange(input_ids.size(0), device=k2_device)
+        seg_hidden = hidden_states[row_indices, seg_positions]
+
+        head_device = next(self.segmentation_head.parameters()).device
+        head_dtype = next(self.segmentation_head.parameters()).dtype
+        mask_logits = self.segmentation_head(
+            vision_tokens.to(device=head_device, dtype=head_dtype),
+            image_mask.to(head_device),
+            seg_hidden.to(device=head_device, dtype=head_dtype),
+        )
+        target_masks = batch["target_masks"].to(device=head_device, dtype=mask_logits.dtype)
+        valid_indices = seg_valid.to(head_device)
+        bce = F.binary_cross_entropy_with_logits(mask_logits[valid_indices], target_masks[valid_indices])
+        dice = dice_loss_from_logits(mask_logits[valid_indices], target_masks[valid_indices])
+        outputs.loss = outputs.loss + self.mask_loss_weight * bce + self.mask_dice_weight * dice
+        outputs.mask_loss = bce.detach()
+        outputs.mask_dice_loss = dice.detach()
+        outputs.mask_supervised = valid_indices.sum().detach()
+        outputs.mask_logits = mask_logits
         return outputs
-
-
-def dice_loss_from_logits(logits, target):
-    prob = torch.sigmoid(logits)
-    intersection = (prob * target).sum(dim=(1, 2, 3))
-    denominator = prob.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
-    return (1 - (2 * intersection + 1e-6) / (denominator + 1e-6)).mean()
-
-
-def weighted_focal_bce_with_logits(logits, target, pos_weight=FAULT_POS_WEIGHT, gamma=FAULT_FOCAL_GAMMA):
-    weights = torch.ones_like(target)
-    weights = torch.where(target > 0.5, weights * pos_weight, weights)
-    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-    if gamma <= 0:
-        return (bce * weights).mean()
-    prob = torch.sigmoid(logits)
-    pt = torch.where(target > 0.5, prob, 1.0 - prob)
-    focal = (1.0 - pt).clamp_min(1e-6).pow(gamma)
-    return (bce * weights * focal).mean()
-
-
-def save_fault_overlay_prediction(image, overlay_prob, output_path, threshold=0.5, alpha=0.45):
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    base = image.convert("RGB")
-    mask = overlay_prob.detach().float().cpu().squeeze().clamp(0, 1).numpy()
-    mask_image = Image.fromarray((mask * 255).astype(np.uint8), mode="L").resize(base.size, Image.Resampling.BILINEAR)
-
-    base_array = np.asarray(base).astype(np.float32)
-    mask_array = np.asarray(mask_image).astype(np.float32) / 255.0
-    hard_mask = mask_array >= threshold
-
-    heat = np.zeros_like(base_array)
-    heat[..., 0] = 255.0
-    heat[..., 1] = 40.0
-    heat[..., 2] = 40.0
-    blend_weight = (mask_array * alpha)[..., None]
-    overlay = base_array * (1.0 - blend_weight) + heat * blend_weight
-    overlay[hard_mask] = overlay[hard_mask] * 0.65 + heat[hard_mask] * 0.35
-
-    Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8)).save(output_path)
-    return output_path
-
-
-def save_fault_mask_prediction(overlay_prob, output_path, size=None):
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    mask = overlay_prob.detach().float().cpu().squeeze().clamp(0, 1).numpy()
-    mask_image = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
-    if size is not None:
-        mask_image = mask_image.resize(size, Image.Resampling.BILINEAR)
-    mask_image.save(output_path)
-    return output_path
-
-
-class K2VisionTrainer(Trainer):
-    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
-        target_model = model or self.model
-        try:
-            result = super()._load_from_checkpoint(resume_from_checkpoint, model=model)
-        except ValueError as error:
-            if not has_k2_vision_checkpoint_parts(resume_from_checkpoint):
-                raise
-            print(f"skipping standard HF checkpoint model load: {error}")
-            result = None
-        if hasattr(target_model, "load_checkpoint_parts"):
-            target_model.load_checkpoint_parts(resume_from_checkpoint)
-        return result
-
-    def _save_checkpoint(self, model, trial):
-        super()._save_checkpoint(model, trial)
-        checkpoint_folder = f"checkpoint-{self.state.global_step}"
-        output_dir = Path(self._get_output_dir(trial=trial)) / checkpoint_folder
-        if hasattr(model, "save_checkpoint_parts"):
-            model.save_checkpoint_parts(output_dir)
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        outputs = model(**inputs)
-        loss = outputs.loss
-        return (loss, outputs) if return_outputs else loss
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        with torch.no_grad():
-            outputs = model(**inputs)
-            loss = outputs.loss.detach()
-        return loss, None, None
-
-    def save_model(self, output_dir=None, _internal_call=False):
-        output_dir = output_dir or self.args.output_dir
-        self.model.save_pretrained(output_dir)
 
 
 def save_training_history(log_history, output_dir):
@@ -1341,18 +790,82 @@ def save_training_history(log_history, output_dir):
     print(f"saved loss plot to {plot_path}")
 
 
+def save_mask_prediction(mask_prob, output_path, size=None):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    mask = mask_prob.detach().float().cpu().squeeze().clamp(0, 1).numpy()
+    mask_image = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+    if size is not None:
+        mask_image = mask_image.resize(size, Image.Resampling.BILINEAR)
+    mask_image.save(output_path)
+    return output_path
+
+
+def save_overlay_prediction(image, mask_prob, output_path, threshold=0.5, alpha=0.45):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    base = image.convert("RGB")
+    mask = mask_prob.detach().float().cpu().squeeze().clamp(0, 1).numpy()
+    mask_image = Image.fromarray((mask * 255).astype(np.uint8), mode="L").resize(base.size, Image.Resampling.BILINEAR)
+    mask_array = np.asarray(mask_image).astype(np.float32) / 255.0
+    base_array = np.asarray(base).astype(np.float32)
+
+    heat = np.zeros_like(base_array)
+    heat[..., 0] = 255.0
+    heat[..., 1] = 40.0
+    heat[..., 2] = 40.0
+    blend = (mask_array * alpha)[..., None]
+    overlay = base_array * (1.0 - blend) + heat * blend
+    hard_mask = mask_array >= threshold
+    overlay[hard_mask] = overlay[hard_mask] * 0.65 + heat[hard_mask] * 0.35
+    Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8)).save(output_path)
+    return output_path
+
+
+def evaluate_loss(model, data_loader):
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for batch in data_loader:
+            outputs = model(**batch)
+            losses.append(float(outputs.loss.detach().cpu()))
+    model.train()
+    return sum(losses) / max(len(losses), 1)
+
+
+def start_wandb_run(enabled, project, entity, run_name, mode, output_dir):
+    if not enabled:
+        return None
+    os.environ.setdefault("WANDB_CONSOLE", "off")
+    os.environ.setdefault("WANDB_SILENT", "true")
+    wandb_dir = Path(output_dir) / "wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    import wandb
+
+    return wandb.init(
+        project=project,
+        entity=entity,
+        name=run_name,
+        mode=mode,
+        dir=wandb_dir.as_posix(),
+        config={"output_dir": Path(output_dir).as_posix()},
+    )
+
+
 def run_pipeline(
     image_path,
     k2_dir=K2_MODEL_DIR,
     trained_dir=K2_FINAL_DIR,
     projector_path=None,
     vision_adapter_dir=None,
-    fault_overlay_head_path=None,
-    fault_overlay_output=None,
-    fault_mask_output=None,
-    fault_overlay_threshold=0.5,
     vision_token_drop_rate=0.0,
     question=None,
+    max_new_tokens=128,
+    segmentation_head_path=None,
+    mask_output=None,
+    overlay_output=None,
+    overlay_threshold=0.5,
+    mask_output_size=DEFAULT_MASK_OUTPUT_SIZE,
 ):
     image = Image.open(image_path).convert("RGB")
     trained_dir = Path(trained_dir)
@@ -1368,78 +881,48 @@ def run_pipeline(
         K2_TRAINED_PROJECTOR,
         VISION_PREFIX_PROJECTOR,
     )
-    fault_overlay_head_path = resolve_existing_path(
-        fault_overlay_head_path,
-        trained_dir / "fault_overlay_head.pt",
-    )
     if vision_adapter_dir is not None and not has_peft_adapter(vision_adapter_dir):
         print(f"ignoring incomplete Qwen vision adapter directory: {vision_adapter_dir}")
         vision_adapter_dir = resolve_existing_peft_adapter(K2_TRAINED_VISION_ADAPTER_DIR, VISION_ADAPTER_DIR)
     qwen_model, qwen_processor = load_qwen_vision_encoder(adapter_dir=vision_adapter_dir)
     k2_lora_dir = trained_dir / "k2_lora_adapter"
-    k2_model, k2_tokenizer = load_k2(
-        k2_dir,
-        lora_adapter_dir=k2_lora_dir if has_peft_adapter(k2_lora_dir) else None,
-    )
+    k2_model, k2_tokenizer = load_k2(k2_dir, lora_adapter_dir=k2_lora_dir if has_peft_adapter(k2_lora_dir) else None)
+    seg_token_id = ensure_seg_token(k2_model, k2_tokenizer)
 
     vision_hidden_size = get_hidden_size(qwen_model)
     k2_hidden_size = get_hidden_size(k2_model)
-    projector = load_or_create_projector(
-        vision_hidden_size,
-        k2_hidden_size,
-        projector_path,
-    )
+    projector = load_or_create_projector(vision_hidden_size, k2_hidden_size, projector_path)
     projector = projector.to(k2_model.get_input_embeddings().weight.device)
     projector.eval()
-    fault_overlay_head = None
-    if fault_overlay_head_path is not None and fault_overlay_head_path.exists():
-        fault_overlay_head = load_fault_overlay_head_compatible(vision_hidden_size, fault_overlay_head_path)
-        fault_overlay_head = fault_overlay_head.to(k2_model.get_input_embeddings().weight.device)
-        fault_overlay_head.eval()
+    segmentation_head_path = resolve_existing_path(
+        segmentation_head_path,
+        trained_dir / "segmentation_head.pt",
+        segmentation_head_path_for(trained_dir.parent),
+    )
+    segmentation_head = None
+    if segmentation_head_path is not None and Path(segmentation_head_path).exists():
+        segmentation_head = load_or_create_segmentation_head(
+            vision_hidden_size,
+            k2_hidden_size,
+            segmentation_head_path,
+            output_size=mask_output_size,
+        )
+        segmentation_head = segmentation_head.to(k2_model.get_input_embeddings().weight.device)
+        segmentation_head.eval()
 
-    if fault_overlay_head is None:
-        qwen_vision_latent = encode_image_with_qwen(
-            qwen_model,
-            qwen_processor,
-            image,
-            token_drop_rate=vision_token_drop_rate,
-        )
-        fault_outputs = {}
+    qwen_encoded = encode_image_with_qwen(
+        qwen_model,
+        qwen_processor,
+        image,
+        token_drop_rate=vision_token_drop_rate,
+        return_tokens=segmentation_head is not None,
+    )
+    if segmentation_head is None:
+        qwen_vision_latent = qwen_encoded
+        vision_tokens = None
+        image_mask = None
     else:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": IMAGE_PROMPT},
-                ],
-            }
-        ]
-        qwen_prompt = qwen_processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        qwen_inputs = qwen_processor(text=[qwen_prompt], images=[[image]], return_tensors="pt")
-        qwen_inputs = {
-            key: value.to(next(qwen_model.parameters()).device) if hasattr(value, "to") else value
-            for key, value in qwen_inputs.items()
-        }
-        with torch.no_grad():
-            qwen_vision_latent, vision_tokens, image_mask = encode_qwen_inputs(
-                qwen_model,
-                qwen_processor,
-                qwen_inputs,
-                token_drop_rate=vision_token_drop_rate,
-                return_tokens=True,
-            )
-            head_device = next(fault_overlay_head.parameters()).device
-            head_dtype = next(fault_overlay_head.parameters()).dtype
-            fault_outputs = fault_overlay_head(
-                vision_tokens.to(device=head_device, dtype=head_dtype),
-                image_mask.to(head_device),
-                qwen_vision_latent.to(device=head_device, dtype=head_dtype),
-            )
+        qwen_vision_latent, vision_tokens, image_mask = qwen_encoded
     qwen_vision_latent = qwen_vision_latent.to(
         device=next(projector.parameters()).device,
         dtype=next(projector.parameters()).dtype,
@@ -1448,33 +931,31 @@ def run_pipeline(
         visual_prefix = projector(qwen_vision_latent)
 
     prompt = build_k2_vqa_prompt(question) if question else K2_PROMPT
-    answer = generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt)
+    answer = generate_with_visual_prefix(k2_model, k2_tokenizer, visual_prefix, prompt, max_new_tokens=max_new_tokens)
 
     print("k2 attached vision pipeline")
     print(f"image: {image_path}")
     if question:
         print(f"question: {question}")
     print(f"k2_answer: {answer}")
-    if fault_outputs:
-        presence = torch.sigmoid(fault_outputs["fault_presence_logits"]).detach().cpu().flatten()[0].item()
-        overlay = torch.sigmoid(fault_outputs["fault_overlay_logits"]).detach().cpu()
-        print(f"fault_presence: {presence:.4f}")
-        print(f"fault_overlay_mean: {float(overlay.mean()):.4f}")
-        if fault_overlay_output is not None:
-            output_path = save_fault_overlay_prediction(
-                image,
-                overlay[0],
-                fault_overlay_output,
-                threshold=fault_overlay_threshold,
+    if segmentation_head is not None and (mask_output is not None or overlay_output is not None):
+        seg_hidden = get_k2_hidden_for_seg_token(k2_model, k2_tokenizer, visual_prefix, prompt, answer, seg_token_id)
+        head_device = next(segmentation_head.parameters()).device
+        head_dtype = next(segmentation_head.parameters()).dtype
+        with torch.no_grad():
+            mask_logits = segmentation_head(
+                vision_tokens.to(device=head_device, dtype=head_dtype),
+                image_mask.to(head_device),
+                seg_hidden.to(device=head_device, dtype=head_dtype),
             )
-            print(f"fault_overlay_output: {output_path}")
-        if fault_mask_output is not None:
-            output_path = save_fault_mask_prediction(
-                overlay[0],
-                fault_mask_output,
-                size=image.size,
-            )
-            print(f"fault_mask_output: {output_path}")
+            mask_prob = torch.sigmoid(mask_logits)[0]
+        print(f"mask_mean: {float(mask_prob.mean()):.4f}")
+        if mask_output is not None:
+            output_path = save_mask_prediction(mask_prob, mask_output, size=image.size)
+            print(f"mask_output: {output_path}")
+        if overlay_output is not None:
+            output_path = save_overlay_prediction(image, mask_prob, overlay_output, threshold=overlay_threshold)
+            print(f"overlay_output: {output_path}")
 
 
 def train_attached_vision(
@@ -1482,48 +963,38 @@ def train_attached_vision(
     output_dir=K2_VISION_OUTPUT_DIR,
     projector_path=None,
     vision_token_drop_rate=VISION_TOKEN_DROP_RATE,
-    train_jsonl=DEFAULT_TRAIN_JSONL,
-    eval_jsonl=DEFAULT_EVAL_JSONL,
+    train_data=DEFAULT_TRAIN_DATA,
+    eval_data=DEFAULT_EVAL_DATA,
     epochs=1,
     logging_steps=10,
     k2_max_length=2048,
     do_eval=False,
     train_k2_lora=True,
     k2_lora_r=8,
-    train_fault_overlay_head=True,
-    allow_pseudo_fault_labels=False,
     train_qwen_vision_adapter=True,
     max_image_side=DEFAULT_MAX_IMAGE_SIDE,
-    fault_output_size=FAULT_OVERLAY_SIZE,
-    fault_overlay_loss_weight=1.0,
-    fault_presence_loss_weight=0.5,
-    fault_pos_weight=FAULT_POS_WEIGHT,
-    fault_focal_gamma=FAULT_FOCAL_GAMMA,
+    mask_output_size=DEFAULT_MASK_OUTPUT_SIZE,
+    train_segmentation_head=True,
+    mask_loss_weight=DEFAULT_MASK_LOSS_WEIGHT,
+    mask_dice_weight=DEFAULT_MASK_DICE_WEIGHT,
+    wandb_project=DEFAULT_WANDB_PROJECT,
+    wandb_entity=None,
+    wandb_run_name=None,
+    wandb_mode="online",
+    disable_wandb=False,
 ):
     output_dir = Path(output_dir)
     final_dir = final_dir_for(output_dir)
-    vision_adapter_dir = resolve_existing_path(
-        adapter_dir_for(output_dir),
-        K2_TRAINED_VISION_ADAPTER_DIR,
-        VISION_ADAPTER_DIR,
-    )
+    if wandb_run_name is None:
+        wandb_run_name = f"k2-seismic-lisa-{time.strftime('%Y%m%d-%H%M%S')}"
+    vision_adapter_dir = resolve_existing_path(adapter_dir_for(output_dir), K2_TRAINED_VISION_ADAPTER_DIR, VISION_ADAPTER_DIR)
     if vision_adapter_dir is not None and not has_peft_adapter(vision_adapter_dir):
         print(f"ignoring incomplete Qwen vision adapter directory: {vision_adapter_dir}")
         vision_adapter_dir = resolve_existing_peft_adapter(K2_TRAINED_VISION_ADAPTER_DIR, VISION_ADAPTER_DIR)
-    projector_path = resolve_existing_path(
-        projector_path,
-        projector_path_for(output_dir),
-        K2_TRAINED_PROJECTOR,
-        VISION_PREFIX_PROJECTOR,
-    )
-    qwen_model, qwen_processor = load_qwen_vision_encoder(
-        trainable=train_qwen_vision_adapter,
-        adapter_dir=vision_adapter_dir,
-    )
-    k2_lora_dir = resolve_existing_path(
-        k2_lora_dir_for(output_dir),
-        K2_TRAINED_LORA_DIR,
-    )
+    projector_path = resolve_existing_path(projector_path, projector_path_for(output_dir), K2_TRAINED_PROJECTOR, VISION_PREFIX_PROJECTOR)
+
+    qwen_model, qwen_processor = load_qwen_vision_encoder(trainable=train_qwen_vision_adapter, adapter_dir=vision_adapter_dir)
+    k2_lora_dir = resolve_existing_path(k2_lora_dir_for(output_dir), K2_TRAINED_LORA_DIR)
     if k2_lora_dir is not None and not has_peft_adapter(k2_lora_dir):
         print(f"ignoring incomplete K2 LoRA adapter directory: {k2_lora_dir}")
         k2_lora_dir = resolve_existing_peft_adapter(K2_TRAINED_LORA_DIR)
@@ -1539,328 +1010,132 @@ def train_attached_vision(
 
     vision_hidden_size = get_hidden_size(qwen_model)
     k2_hidden_size = get_hidden_size(k2_model)
-    projector = load_or_create_projector(
-        vision_hidden_size,
-        k2_hidden_size,
-        projector_path,
-    )
+    projector = load_or_create_projector(vision_hidden_size, k2_hidden_size, projector_path)
     projector = projector.to(k2_model.get_input_embeddings().weight.device)
     projector.train()
-    fault_overlay_head = None
-    if train_fault_overlay_head:
-        fault_overlay_head = load_fault_overlay_head_compatible(
-            vision_hidden_size,
-            fault_overlay_head_path_for(output_dir),
-            output_size=fault_output_size,
-        )
-        fault_overlay_head = fault_overlay_head.to(k2_model.get_input_embeddings().weight.device)
-        fault_overlay_head.train()
 
-    model = FrozenK2VisionModel(
+    train_dataset = ExportedMultimodalDataset(train_data, max_image_side=max_image_side, mask_output_size=mask_output_size)
+    eval_dataset = (
+        ExportedMultimodalDataset(eval_data, max_image_side=max_image_side, mask_output_size=mask_output_size)
+        if do_eval
+        else None
+    )
+    train_mask_count = sum(
+        1 for record in train_dataset.records if record.get("mask_image") and Path(record["mask_image"]).exists()
+    )
+    if train_segmentation_head and train_mask_count == 0:
+        print("segmentation head disabled: no mask_image files found in train data.")
+        train_segmentation_head = False
+    seg_token_id = ensure_seg_token(k2_model, k2_tokenizer) if train_segmentation_head else None
+
+    segmentation_head = None
+    if train_segmentation_head:
+        segmentation_head = load_or_create_segmentation_head(
+            vision_hidden_size,
+            k2_hidden_size,
+            segmentation_head_path_for(output_dir),
+            output_size=mask_output_size,
+        )
+        segmentation_head = segmentation_head.to(k2_model.get_input_embeddings().weight.device)
+        segmentation_head.train()
+
+    model = K2VisionModel(
         qwen_model=qwen_model,
         qwen_processor=qwen_processor,
         k2_model=k2_model,
         projector=projector,
-        fault_overlay_head=fault_overlay_head,
+        segmentation_head=segmentation_head,
+        seg_token_id=seg_token_id,
         vision_token_drop_rate=vision_token_drop_rate,
-        fault_overlay_loss_weight=fault_overlay_loss_weight,
-        fault_presence_loss_weight=fault_presence_loss_weight,
-        fault_pos_weight=fault_pos_weight,
-        fault_focal_gamma=fault_focal_gamma,
+        mask_loss_weight=mask_loss_weight,
+        mask_dice_weight=mask_dice_weight,
     )
 
-    train_dataset = K2VisionDataset(
-        train_jsonl,
-        allow_pseudo_fault_labels=allow_pseudo_fault_labels,
-        max_image_side=max_image_side,
-        fault_output_size=fault_output_size,
-    )
-    eval_dataset = (
-        K2VisionDataset(
-            eval_jsonl,
-            allow_pseudo_fault_labels=allow_pseudo_fault_labels,
-            max_image_side=max_image_side,
-            fault_output_size=fault_output_size,
-        )
-        if do_eval
-        else None
-    )
-    print(f"max image side for Qwen training inputs: {max_image_side}")
-    print(
-        "fault head config: "
-        f"output_size={fault_output_size}, overlay_weight={fault_overlay_loss_weight}, "
-        f"presence_weight={fault_presence_loss_weight}, pos_weight={fault_pos_weight}, focal_gamma={fault_focal_gamma}"
-    )
-    print(f"train fault label sources: {train_dataset.fault_label_source_counts}")
-    if train_fault_overlay_head and train_dataset.fault_label_source_counts["real"] == 0:
-        if train_dataset.fault_label_source_counts["pseudo"] > 0:
-            print("warning: fault overlay head will train only from pseudo-labels because no real mask labels were found.")
-        else:
-            print("warning: no fault overlay labels found; auxiliary fault head receives no supervised loss.")
+    print(f"train records: {len(train_dataset)} from {train_data}")
+    print(f"train mask records: {train_mask_count}")
     if eval_dataset is not None:
-        print(f"eval fault label sources: {eval_dataset.fault_label_source_counts}")
-    args = TrainingArguments(
-        output_dir=Path(output_dir).as_posix(),
-        logging_dir="logs",
-        learning_rate=1e-4,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
-        gradient_accumulation_steps=4,
-        num_train_epochs=epochs,
-        weight_decay=0.02,
-        warmup_steps=25,
-        gradient_checkpointing=True,
-        logging_strategy="steps",
-        logging_steps=logging_steps,
-        eval_strategy="epoch" if do_eval else "no",
-        save_strategy="epoch",
-        save_total_limit=2,
-        load_best_model_at_end=False,
-        remove_unused_columns=False,
-        bf16=is_bfloat16_supported(),
-        fp16=not is_bfloat16_supported(),
+        print(f"eval records: {len(eval_dataset)} from {eval_data}")
+    print(f"max image side for Qwen training inputs: {max_image_side}")
+    if segmentation_head is not None:
+        print(
+            "segmentation head enabled: "
+            f"seg_token={SEG_TOKEN}, mask_output_size={mask_output_size}, "
+            f"bce_weight={mask_loss_weight}, dice_weight={mask_dice_weight}"
+        )
+
+    collator = K2VisionCollator(qwen_processor, k2_tokenizer, max_length=k2_max_length)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, collate_fn=collator)
+    eval_loader = DataLoader(eval_dataset, batch_size=1, shuffle=False, collate_fn=collator) if eval_dataset else None
+
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0.02)
+    wandb_run = start_wandb_run(
+        enabled=not disable_wandb,
+        project=wandb_project,
+        entity=wandb_entity,
+        run_name=wandb_run_name,
+        mode=wandb_mode,
+        output_dir=output_dir,
     )
 
-    trainer = K2VisionTrainer(
-        model=model,
-        args=args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=K2VisionCollator(qwen_processor, k2_tokenizer, max_length=k2_max_length),
-    )
-    resume_checkpoint = latest_checkpoint(output_dir)
-    try:
-        trainer.train(resume_from_checkpoint=resume_checkpoint)
-    except ValueError as error:
-        if resume_checkpoint is None or "parameter group" not in str(error):
-            raise
-        print(
-            "optimizer state is incompatible with the current trainable parameter set; "
-            "retrying from checkpoint model weights without optimizer/scheduler state."
-        )
-        moved = quarantine_trainer_state_for_retry(resume_checkpoint)
-        try:
-            trainer.train(resume_from_checkpoint=resume_checkpoint)
-        finally:
-            restore_quarantined_trainer_state(moved)
-    if do_eval:
-        trainer.evaluate()
-    save_training_history(trainer.state.log_history, output_dir)
-    trainer.save_model(final_dir.as_posix())
+    log_history = []
+    global_step = 0
+    gradient_accumulation_steps = 4
+    model.train()
+
+    # Standard manual training loop: the only trainable pieces are K2 LoRA,
+    # the visual-prefix projector, and the optional mask decoder.
+    for epoch in range(int(epochs)):
+        optimizer.zero_grad(set_to_none=True)
+        for step, batch in enumerate(train_loader, start=1):
+            outputs = model(**batch)
+            loss = outputs.loss / gradient_accumulation_steps
+            loss.backward()
+            if step % gradient_accumulation_steps == 0 or step == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+                metrics = {"step": global_step, "epoch": epoch + 1, "loss": float(outputs.loss.detach().cpu())}
+                for name in ("mask_loss", "mask_dice_loss", "mask_supervised"):
+                    value = getattr(outputs, name, None)
+                    if value is not None:
+                        metrics[name] = float(value.detach().float().cpu())
+                log_history.append(metrics)
+                if wandb_run is not None:
+                    wandb_run.log(metrics, step=global_step)
+                if global_step % logging_steps == 0:
+                    print(json.dumps(metrics))
+
+        if eval_loader is not None:
+            eval_loss = evaluate_loss(model, eval_loader)
+            metrics = {"step": global_step, "epoch": epoch + 1, "eval_loss": eval_loss}
+            log_history.append(metrics)
+            if wandb_run is not None:
+                wandb_run.log(metrics, step=global_step)
+            print(json.dumps(metrics))
+
+    if wandb_run is not None:
+        wandb_run.finish()
+
+    save_training_history(log_history, output_dir)
+    model.save_pretrained(final_dir.as_posix())
     qwen_processor.save_pretrained(final_dir / "qwen_vision_adapter")
     k2_tokenizer.save_pretrained(final_dir / "k2_tokenizer")
     torch.save(projector.state_dict(), final_dir / "k2_qwen_vision_projector.pt")
-    if fault_overlay_head is not None:
-        torch.save(fault_overlay_head.state_dict(), final_dir / "fault_overlay_head.pt")
+    if segmentation_head is not None:
+        torch.save(segmentation_head.state_dict(), final_dir / "segmentation_head.pt")
     if isinstance(k2_model, PeftModel):
         k2_model.save_pretrained(final_dir / "k2_lora_adapter")
     Path(projector_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(projector.state_dict(), projector_path)
     print(f"saved trained K2 vision adapter to {final_dir / 'qwen_vision_adapter'}")
     print(f"saved trained projector to {final_dir / 'k2_qwen_vision_projector.pt'}")
-    if fault_overlay_head is not None:
-        print(f"saved trained fault overlay head to {final_dir / 'fault_overlay_head.pt'}")
+    if segmentation_head is not None:
+        print(f"saved trained segmentation head to {final_dir / 'segmentation_head.pt'}")
     if isinstance(k2_model, PeftModel):
         print(f"saved trained K2 LoRA adapter to {final_dir / 'k2_lora_adapter'}")
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    run_parser = subparsers.add_parser("run")
-    run_parser.add_argument("image", help="Path to seismic image.")
-    run_parser.add_argument(
-        "--k2-dir",
-        default=K2_MODEL_DIR.as_posix(),
-        help="Local folder where the full K2 repository is/will be downloaded.",
-    )
-    run_parser.add_argument(
-        "--trained-dir",
-        default=K2_FINAL_DIR.as_posix(),
-        help="Folder containing saved qwen_vision_adapter and k2_qwen_vision_projector.pt.",
-    )
-    run_parser.add_argument(
-        "--vision-adapter",
-        default=None,
-        help="Optional explicit Qwen vision adapter folder. Defaults to --trained-dir/qwen_vision_adapter.",
-    )
-    run_parser.add_argument(
-        "--projector",
-        default=None,
-        help="Optional explicit Qwen-vision-to-K2-prefix projector path. Defaults to --trained-dir/k2_qwen_vision_projector.pt.",
-    )
-    run_parser.add_argument(
-        "--fault-overlay-head",
-        default=None,
-        help="Optional trained fault overlay head path. Defaults to --trained-dir/fault_overlay_head.pt when present.",
-    )
-    run_parser.add_argument(
-        "--fault-overlay-output",
-        default=None,
-        help="Optional PNG path for the predicted model fault overlay.",
-    )
-    run_parser.add_argument(
-        "--fault-mask-output",
-        default=None,
-        help="Optional grayscale PNG path for the raw predicted fault probability mask.",
-    )
-    run_parser.add_argument(
-        "--fault-overlay-threshold",
-        type=float,
-        default=0.5,
-        help="Probability threshold used to emphasize predicted fault overlay pixels.",
-    )
-    run_parser.add_argument(
-        "--vision-token-drop-rate",
-        type=float,
-        default=0.0,
-        help="Image-token drop rate during inference. Default keeps all image tokens.",
-    )
-    run_parser.add_argument(
-        "--question",
-        default=None,
-        help="Optional VQA question. If omitted, uses the default seismic classification prompt.",
-    )
-
-    train_parser = subparsers.add_parser("train")
-    train_parser.add_argument(
-        "--k2-dir",
-        default=K2_MODEL_DIR.as_posix(),
-        help="Local folder where the full K2 repository is/will be downloaded.",
-    )
-    train_parser.add_argument(
-        "--output-dir",
-        default=K2_VISION_OUTPUT_DIR.as_posix(),
-        help="Output folder for trained Qwen vision adapter and projector.",
-    )
-    train_parser.add_argument(
-        "--projector",
-        default=None,
-        help="Optional extra path to save/load the Qwen-vision-to-K2-prefix projector. A copy is always saved under --output-dir/final.",
-    )
-    train_parser.add_argument(
-        "--vision-token-drop-rate",
-        type=float,
-        default=VISION_TOKEN_DROP_RATE,
-        help="Image-token drop rate during training. Default drops 75 percent.",
-    )
-    train_parser.add_argument(
-        "--max-image-side",
-        type=int,
-        default=DEFAULT_MAX_IMAGE_SIDE,
-        help="Resize training images so the longest side is at most this many pixels before Qwen processing. Use 0 to disable.",
-    )
-    train_parser.add_argument(
-        "--fault-output-size",
-        type=int,
-        default=FAULT_OVERLAY_SIZE,
-        help="Fault overlay output resolution. Use 64 for sharper quick-run heatmaps if memory permits.",
-    )
-    train_parser.add_argument(
-        "--train-jsonl",
-        default=DEFAULT_TRAIN_JSONL.as_posix(),
-        help="Generated SFT JSONL for training, usually outputs/generated_unicamp_instructions/train_sft.jsonl.",
-    )
-    train_parser.add_argument(
-        "--eval-jsonl",
-        default=DEFAULT_EVAL_JSONL.as_posix(),
-        help="Generated SFT JSONL for eval, usually outputs/generated_unicamp_instructions/validation_sft.jsonl.",
-    )
-    train_parser.add_argument(
-        "--epochs",
-        type=float,
-        default=1,
-        help="Number of training epochs.",
-    )
-    train_parser.add_argument(
-        "--logging-steps",
-        type=int,
-        default=10,
-        help="How often to log training loss.",
-    )
-    train_parser.add_argument(
-        "--k2-max-length",
-        type=int,
-        default=2048,
-        help="Maximum K2 text tokens. Answer tokens are preserved; prompt tokens are truncated first.",
-    )
-    train_parser.add_argument(
-        "--do-eval",
-        action="store_true",
-        help="Run evaluation each epoch. Disabled by default to avoid OOM on 24GB GPUs.",
-    )
-    train_parser.add_argument(
-        "--no-k2-lora",
-        action="store_true",
-        help="Disable small K2 decoder LoRA training.",
-    )
-    train_parser.add_argument(
-        "--k2-lora-r",
-        type=int,
-        default=8,
-        help="Rank for the small K2 decoder LoRA.",
-    )
-    train_parser.add_argument(
-        "--no-fault-overlay-head",
-        action="store_true",
-        help="Disable the auxiliary model-architecture fault overlay head.",
-    )
-    train_parser.add_argument(
-        "--allow-pseudo-fault-labels",
-        action="store_true",
-        help="Allow FaultNet detections as weak labels when real fault masks/YOLO labels are unavailable.",
-    )
-    train_parser.add_argument("--fault-overlay-loss-weight", type=float, default=1.0)
-    train_parser.add_argument("--fault-presence-loss-weight", type=float, default=0.5)
-    train_parser.add_argument("--fault-pos-weight", type=float, default=FAULT_POS_WEIGHT)
-    train_parser.add_argument("--fault-focal-gamma", type=float, default=FAULT_FOCAL_GAMMA)
-    train_parser.add_argument(
-        "--freeze-qwen-vision-adapter",
-        action="store_true",
-        help="Freeze Qwen vision during training. This is the safest 24GB-GPU mode; trains projector, K2 LoRA, and fault head.",
-    )
-
-    args = parser.parse_args()
-    if args.command == "run":
-        run_pipeline(
-            Path(args.image),
-            Path(args.k2_dir),
-            Path(args.trained_dir),
-            Path(args.projector) if args.projector else None,
-            Path(args.vision_adapter) if args.vision_adapter else None,
-            Path(args.fault_overlay_head) if args.fault_overlay_head else None,
-            Path(args.fault_overlay_output) if args.fault_overlay_output else None,
-            Path(args.fault_mask_output) if args.fault_mask_output else None,
-            args.fault_overlay_threshold,
-            args.vision_token_drop_rate,
-            args.question,
-        )
-    elif args.command == "train":
-        train_attached_vision(
-            Path(args.k2_dir),
-            Path(args.output_dir),
-            Path(args.projector) if args.projector else None,
-            args.vision_token_drop_rate,
-            Path(args.train_jsonl),
-            Path(args.eval_jsonl),
-            args.epochs,
-            args.logging_steps,
-            args.k2_max_length,
-            args.do_eval,
-            not args.no_k2_lora,
-            args.k2_lora_r,
-            not args.no_fault_overlay_head,
-            args.allow_pseudo_fault_labels,
-            not args.freeze_qwen_vision_adapter,
-            args.max_image_side,
-            args.fault_output_size,
-            args.fault_overlay_loss_weight,
-            args.fault_presence_loss_weight,
-            args.fault_pos_weight,
-            args.fault_focal_gamma,
-        )
-
-
 if __name__ == "__main__":
-    main()
+    print("Use main.py for training, scripts/download_k2.py for model download, or scripts/split_dataset.py for data splits.")

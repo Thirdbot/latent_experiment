@@ -1,2 +1,1 @@
-"""Seismic K2 vision training and data generation package."""
-
+"""Seismic K2 vision training package."""
