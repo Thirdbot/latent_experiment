@@ -183,6 +183,9 @@ def load_k2(model_dir=K2_MODEL_DIR, tokenizer_name=K2_TOKENIZER_NAME, lora_adapt
     if is_trainable and quantization_config is not None:
         model = prepare_model_for_kbit_training(model)
     if lora_adapter_dir is not None and has_peft_adapter(lora_adapter_dir):
+        # Some trained adapters include the optional <SEG> token embeddings.
+        # Resize the base model first so PEFT can load those adapter weights.
+        ensure_seg_token(model, tokenizer)
         model = PeftModel.from_pretrained(model, Path(lora_adapter_dir).as_posix(), is_trainable=is_trainable)
         print(f"loaded K2 LoRA adapter from {lora_adapter_dir}")
     elif lora_adapter_dir is not None:
