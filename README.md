@@ -52,6 +52,16 @@ QUESTION="What seismic features are visible in this slice?" \
 uv run python -m seismic_k2.vlm.sample_inference
 ```
 
+If a segmentation head was trained, save mask and overlay outputs:
+
+```bash
+IMAGE=/path/to/seismic_slice.png \
+QUESTION="Segment the target structure." \
+MASK_OUTPUT=outputs/predictions/mask.png \
+OVERLAY_OUTPUT=outputs/predictions/overlay.png \
+uv run python -m seismic_k2.vlm.sample_inference
+```
+
 Train the separate InternVL version:
 
 ```bash
