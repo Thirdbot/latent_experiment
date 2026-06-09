@@ -17,6 +17,7 @@ WANDB_PROJECT = os.getenv("WANDB_PROJECT", "k2-seismic-lisa")
 WANDB_MODE = os.getenv("WANDB_MODE", "online")
 DO_EVAL = os.getenv("DO_EVAL", "1") == "1"
 TRAIN_QWEN_VISION = os.getenv("TRAIN_QWEN_VISION", "1") == "1"
+MAX_IMAGE_SIDE = int(os.getenv("MAX_IMAGE_SIDE", "512"))
 
 
 def main():
@@ -34,6 +35,7 @@ def main():
         do_eval=DO_EVAL,
         train_qwen_vision_adapter=TRAIN_QWEN_VISION,
         train_segmentation_head=False,
+        max_image_side=MAX_IMAGE_SIDE,
         wandb_project=WANDB_PROJECT,
         wandb_mode=WANDB_MODE,
     )

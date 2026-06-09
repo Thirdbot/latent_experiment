@@ -52,6 +52,21 @@ QUESTION="What seismic features are visible in this slice?" \
 uv run python -m seismic_k2.vlm.sample_inference
 ```
 
+Train the separate InternVL version:
+
+```bash
+uv run python scripts/train_internvl.py
+```
+
+Useful InternVL environment variables:
+
+```bash
+INTERNVL_MODEL_ID=OpenGVLab/InternVL3-2B
+INTERNVL_OUTPUT_DIR=outputs/internvl_seismic
+TRAIN_MASK_DECODER=0
+MAX_IMAGE_SIDE=512
+```
+
 ## Simple Configuration
 
 Use environment variables instead of command-line parsers.
@@ -83,6 +98,7 @@ TRAIN_DATA=data/splits/train.csv
 EVAL_DATA=data/splits/validate.csv
 EPOCHS=1
 TRAIN_QWEN_VISION=1
+MAX_IMAGE_SIDE=512
 WANDB_PROJECT=k2-seismic-lisa
 WANDB_MODE=online
 ```
